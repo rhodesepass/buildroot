@@ -26,7 +26,7 @@ index 4eb0e14b1..606e0239f 100644
 +// 	.vrefresh = 60,
 +// };
 +static const struct drm_display_mode lattland_mostima_mode = {
-+	.clock = 12000,
++	.clock = 24000,
 +	.hdisplay = 360,
 +	.hsync_start = 360 + (24 + 60),
 +	.hsync_end = 360 + (24 + 60) + 6,

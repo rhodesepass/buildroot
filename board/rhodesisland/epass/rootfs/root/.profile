@@ -1,7 +1,24 @@
-# if we are not running in /dev/tty0, skip application startup
-if [ "$(tty)" != "/dev/tty0" ]; then
-    echo "Welcome to Rhodes Island Pass Debug Shell!"
-    echo "You are in Terminal $(tty)."
+# if we are not running in /dev/tty0, skip animation
+# if [ "$(tty)" != "/dev/tty0" ]; then
+#     echo "Welcome to Rhodes Island Pass Debug Shell!"
+#     echo "You are in Terminal $(tty)."
+#     return
+# fi
+
+# if epass_drm_app is not present
+if [ ! -f "./epass_drm_app" ]; then
+cat << EOF
+  _   _  ____  _____       _______       
+ | \ | |/ __ \|  __ \   /\|__   __|/\    
+ |  \| | |  | | |  | | /  \  | |  /  \   
+ | . \ | |  | | |  | |/ /\ \ | | / /\ \  
+ | |\  | |__| | |__| / ____ \| |/ ____ \ 
+ |_| \_|\____/|_____/_/    \_\_/_/    \_\
+                                         
+Please copy 'epass_drm_app' and asset files.
+to app directory.
+EOF
+
     return
 fi
 

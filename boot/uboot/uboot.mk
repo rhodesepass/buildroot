@@ -282,7 +282,7 @@ UBOOT_CUSTOM_DTS_PATH = $(call qstrip,$(BR2_TARGET_UBOOT_CUSTOM_DTS_PATH))
 
 define UBOOT_BUILD_CMDS
 	$(if $(UBOOT_CUSTOM_DTS_PATH),
-		cp -f $(UBOOT_CUSTOM_DTS_PATH) $(@D)/arch/$(UBOOT_ARCH)/dts/
+		cp -f $(UBOOT_CUSTOM_DTS_PATH) $(@D)/dts/upstream/src/arm/allwinner/
 	)
 	$(TARGET_CONFIGURE_OPTS) \
 		$(UBOOT_MAKE) -C $(@D) $(UBOOT_MAKE_OPTS) \
