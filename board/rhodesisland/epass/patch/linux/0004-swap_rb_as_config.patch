@@ -1,0 +1,71 @@
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.h
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.h
+@@ -53,6 +53,7 @@
+ #define SUN4I_TCON0_CTL_TCON_ENABLE			BIT(31)
+ #define SUN4I_TCON0_CTL_IF_MASK				GENMASK(25, 24)
+ #define SUN4I_TCON0_CTL_IF_8080				(1 << 24)
++#define SUN4I_TCON0_CTL_SWAP				BIT(23)
+ #define SUN4I_TCON0_CTL_CLK_DELAY_MASK			GENMASK(8, 4)
+ #define SUN4I_TCON0_CTL_CLK_DELAY(delay)		((delay << 4) & SUN4I_TCON0_CTL_CLK_DELAY_MASK)
+ #define SUN4I_TCON0_CTL_SRC_SEL_MASK			GENMASK(2, 0)
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -38,6 +38,8 @@
+ #include "sun8i_tcon_top.h"
+ #include "sunxi_engine.h"
+
++static int panel_type = 0;
++
+ static struct drm_connector *sun4i_tcon_get_connector(const struct drm_encoder *encoder)
+ {
+        struct drm_connector *connector;
+@@ -503,6 +503,14 @@
+ 			   SUN4I_TCON0_CTL_CLK_DELAY_MASK,
+ 			   SUN4I_TCON0_CTL_CLK_DELAY(clk_delay));
+ 
++	/* Swap Red & Blue of LCD */
++	if(panel_type){
++		regmap_update_bits(tcon->regs, SUN4I_TCON0_CTL_REG,
++			   SUN4I_TCON0_CTL_SWAP,
++			   SUN4I_TCON0_CTL_SWAP);
++	}
++
++
+ 	/*
+ 	 * This is called a backporch in the register documentation,
+ 	 * but it really is the back porch + hsync
+@@ -1321,6 +1329,7 @@
+ 	struct drm_bridge *bridge;
+ 	struct drm_panel *panel;
+ 	int ret;
++	uint32_t orig_gpio_val;
+ 
+ 	quirks = of_device_get_match_data(&pdev->dev);
+ 
+@@ -1331,6 +1340,26 @@
+ 			return ret;
+ 	}
+ 
++	// some very dirty things happened again.....
++	printk("srgn: start panel type detection\n");
++
++	volatile void* gpio_mode_reg = ioremap(0x01c20800 + 0x94,4);
++	volatile void* gpio_val_reg = ioremap(0x01c20800 + 0xA0,4);
++
++	orig_gpio_val = readl(gpio_mode_reg);
++	writel(orig_gpio_val & ~((7ul) << 12),gpio_mode_reg);
++	mdelay(10);
++	if(readl(gpio_val_reg) & (1ul << 11)){
++		printk("srgn: laowang 3 yuan tft detected\n");
++		panel_type = 1;
++	}
++	else{
++		printk("srgn: generic ips detected\n");
++		panel_type = 0;
++	}
++
++	writel(orig_gpio_val,gpio_mode_reg);
++	
+ 	return component_add(&pdev->dev, &sun4i_tcon_ops);
+ }
+ 
