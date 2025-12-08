@@ -13,18 +13,19 @@
 @@ -38,6 +38,8 @@
  #include "sun8i_tcon_top.h"
  #include "sunxi_engine.h"
-
-+static int panel_type = 0;
+ 
++static int swap_b_r = 0;
 +
  static struct drm_connector *sun4i_tcon_get_connector(const struct drm_encoder *encoder)
  {
-        struct drm_connector *connector;
-@@ -503,6 +503,14 @@
+ 	struct drm_connector *connector;
+@@ -501,6 +503,15 @@
  			   SUN4I_TCON0_CTL_CLK_DELAY_MASK,
  			   SUN4I_TCON0_CTL_CLK_DELAY(clk_delay));
  
 +	/* Swap Red & Blue of LCD */
-+	if(panel_type){
++	if(swap_b_r){
++		printk("srgn: do swap.");
 +		regmap_update_bits(tcon->regs, SUN4I_TCON0_CTL_REG,
 +			   SUN4I_TCON0_CTL_SWAP,
 +			   SUN4I_TCON0_CTL_SWAP);
@@ -34,37 +35,16 @@
  	/*
  	 * This is called a backporch in the register documentation,
  	 * but it really is the back porch + hsync
-@@ -1321,6 +1329,7 @@
- 	struct drm_bridge *bridge;
- 	struct drm_panel *panel;
- 	int ret;
-+	uint32_t orig_gpio_val;
- 
- 	quirks = of_device_get_match_data(&pdev->dev);
- 
-@@ -1331,6 +1340,26 @@
+@@ -1329,6 +1340,13 @@
  			return ret;
  	}
  
-+	// some very dirty things happened again.....
-+	printk("srgn: start panel type detection\n");
-+
-+	volatile void* gpio_mode_reg = ioremap(0x01c20800 + 0x94,4);
-+	volatile void* gpio_val_reg = ioremap(0x01c20800 + 0xA0,4);
-+
-+	orig_gpio_val = readl(gpio_mode_reg);
-+	writel(orig_gpio_val & ~((7ul) << 12),gpio_mode_reg);
-+	mdelay(10);
-+	if(readl(gpio_val_reg) & (1ul << 11)){
-+		printk("srgn: laowang 3 yuan tft detected\n");
-+		panel_type = 1;
++	// no more dirty things happen! oh yeah!
++	swap_b_r = of_property_read_bool(node, "srgn,swap-b-r");
++	
++	if(swap_b_r){
++		printk("srgn: swap r&b as per device tree.\n");
 +	}
-+	else{
-+		printk("srgn: generic ips detected\n");
-+		panel_type = 0;
-+	}
-+
-+	writel(orig_gpio_val,gpio_mode_reg);
 +	
  	return component_add(&pdev->dev, &sun4i_tcon_ops);
  }
