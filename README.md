@@ -13,7 +13,7 @@
 ### 安装工具包
 ``` shell
 sudo apt install wget unzip build-essential git bc swig libncurses-dev libpython3-dev libssl-dev mtd-utils
-sudo apt install python3-distutils
+sudo apt install python3-distutils fakeroot
 ```
 
 ### 克隆本仓库
