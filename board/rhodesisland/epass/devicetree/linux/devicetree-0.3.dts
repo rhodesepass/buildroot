@@ -3,6 +3,8 @@
 /dts-v1/;
 #include "suniv-f1c100s.dtsi"
 #include <dt-bindings/input/input.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/display/st7701initseq.h>
 
 / {
 	model = "Arknights_Electric_Pass_Ver0.3";
@@ -29,7 +31,7 @@
 		// };
 	};
 
-		panel: panel {
+	panel: panel {
 		// compatible = "qiaodian,qd43003c0-40", "simple-panel";	// 4.3 inch,480x272
 		//compatible = "foxlink,fl500wvr00-a0t", "simple-panel";	// 4.3 & 5 inch,800x480
 		//compatible = "hongxiangrui,hxr401-40", "simple-panel";	// 480x480
@@ -84,6 +86,145 @@
 	// 			no-map;
 	// 		};
 	// };
+
+	st7701initseq: st7701initseq {
+		compatible = "lattland,st7701-initseq";
+		status = "okay";
+		sda-gpios = <&pio 4 4 GPIO_ACTIVE_HIGH>; /* PE4 */
+		scl-gpios = <&pio 3 19 GPIO_ACTIVE_HIGH>; /* PD19 */
+		cs-gpios = <&pio 4 3 GPIO_ACTIVE_HIGH>; /* PE3 */
+
+		init-sequence = <
+			ST7701INIT_BEGIN_WRITE
+
+			ST7701INIT_WRITE_COMMAND_8 0xFF 
+			ST7701INIT_WRITE_BYTES 5 0x77 0x01 0x00 0x00 0x13 
+
+			ST7701INIT_WRITE_C8_D8 0xEF 0x08 
+
+			ST7701INIT_WRITE_COMMAND_8 0xFF 
+			ST7701INIT_WRITE_BYTES 5 0x77 0x01 0x00 0x00 0x10 
+
+			ST7701INIT_WRITE_C8_D16 0xC0 0x4F 0x00
+			ST7701INIT_WRITE_C8_D16 0xC1 0x07 0x02  
+			ST7701INIT_WRITE_C8_D16 0xC2 0x31 0x05 
+
+			
+			ST7701INIT_WRITE_COMMAND_8 0xC3 
+			ST7701INIT_WRITE_BYTES 3 0x82 0x18 0x0e 
+
+			ST7701INIT_WRITE_C8_D8 0xCC 0x10 
+
+			ST7701INIT_WRITE_COMMAND_8 0xB0 
+			ST7701INIT_WRITE_BYTES 16 
+			0x0A 0x14 0x1B 0x0D 
+			0x10 0x05 0x07 0x08 
+			0x06 0x22 0x03 0x11 
+			0x10 0xAD 0x31 0x1B 
+
+			ST7701INIT_WRITE_COMMAND_8 0xB1 
+			ST7701INIT_WRITE_BYTES 16 
+			0x0A 0x14 0x1B 0x0D 
+			0x10 0x05 0x07 0x08 
+			0x06 0x22 0x03 0x11 
+			0x10 0xAD 0x31 0x1B 
+
+			ST7701INIT_WRITE_COMMAND_8 0xFF 
+			ST7701INIT_WRITE_BYTES 5 0x77 0x01 0x00 0x00 0x11 
+
+			ST7701INIT_WRITE_C8_D8 0xB0 0x53 
+			ST7701INIT_WRITE_C8_D8 0xB1 0x60 
+			ST7701INIT_WRITE_C8_D8 0xB2 0x07 
+			ST7701INIT_WRITE_C8_D8 0xB3 0x80 
+			ST7701INIT_WRITE_C8_D8 0xB5 0x49 
+			ST7701INIT_WRITE_C8_D8 0xB7 0x85 
+			ST7701INIT_WRITE_C8_D8 0xB8 0x21 
+			ST7701INIT_WRITE_C8_D8 0xC1 0x78 
+			ST7701INIT_WRITE_C8_D8 0xC2 0x78 
+
+			ST7701INIT_WRITE_COMMAND_8 0xE0 
+			ST7701INIT_WRITE_BYTES 3 0x00 0x00 0x02 
+
+			ST7701INIT_WRITE_COMMAND_8 0xE1 
+			ST7701INIT_WRITE_BYTES 11 
+			0x03 0xA0 0x00 0x00 
+			0x02 0xA0 0x00 0x00 
+			0x00 0x33 0x33 
+
+			ST7701INIT_WRITE_COMMAND_8 0xE2 
+			ST7701INIT_WRITE_BYTES 12 
+			0x22 0x22 0x33 0x33 
+			0x88 0xA0 0x00 0x00 
+			0x87 0xA0 0x00 0x00 
+
+			ST7701INIT_WRITE_COMMAND_8 0xE3 
+			ST7701INIT_WRITE_BYTES 4 0x00 0x00 0x22 0x22 
+
+			ST7701INIT_WRITE_C8_D16 0xE4 0x44 0x44 
+
+			ST7701INIT_WRITE_COMMAND_8 0xE5 
+			ST7701INIT_WRITE_BYTES 16 
+			0x04 0x84 0xA0 0xA0 
+			0x06 0x86 0xA0 0xA0 
+			0x08 0x88 0xA0 0xA0 
+			0x0A 0x8A 0xA0 0xA0 
+
+			ST7701INIT_WRITE_COMMAND_8 0xE6 
+			ST7701INIT_WRITE_BYTES 4 0x00 0x00 0x22 0x22 
+
+			ST7701INIT_WRITE_C8_D16 0xE7 0x44 0x44 
+
+			ST7701INIT_WRITE_COMMAND_8 0xE8 
+			ST7701INIT_WRITE_BYTES 16 
+			0x03 0x83 0xA0 0xA0 
+			0x05 0x85 0xA0 0xA0 
+			0x07 0x87 0xA0 0xA0 
+			0x09 0x89 0xA0 0xA0 
+
+			ST7701INIT_WRITE_COMMAND_8 0xEB 
+			ST7701INIT_WRITE_BYTES 7 
+			0x00 0x01 0xE4 0xE4 
+			0x88 0x00 0x40 
+
+			ST7701INIT_WRITE_C8_D16 0xEC 0x3C 0x01 
+
+			ST7701INIT_WRITE_COMMAND_8 0xED 
+			ST7701INIT_WRITE_BYTES 16 
+			0xAB 0x89 0x76 0x54 
+			0x02 0xFF 0xFF 0xFF 
+			0xFF 0xFF 0xFF 0x20 
+			0x45 0x67 0x98 0xBA 
+
+			ST7701INIT_WRITE_COMMAND_8 0xFF 
+			ST7701INIT_WRITE_BYTES 5 0x77 0x01 0x00 0x00 0x13 
+
+			ST7701INIT_WRITE_C8_D16 0xE8 0x00 0x0E 
+
+			ST7701INIT_WRITE_COMMAND_8 0x20 
+			ST7701INIT_WRITE_C8_D8 0x3A 0x50 
+
+			ST7701INIT_WRITE_COMMAND_8 0x11 
+			ST7701INIT_END_WRITE 
+
+			ST7701INIT_DELAY 150 
+
+			ST7701INIT_BEGIN_WRITE 
+			ST7701INIT_WRITE_C8_D16 0xE8 0x00 0x0C 
+			ST7701INIT_END_WRITE 
+
+			ST7701INIT_DELAY 100 
+
+			ST7701INIT_BEGIN_WRITE 
+			ST7701INIT_WRITE_C8_D16 0xE8 0x00 0x00 
+
+			ST7701INIT_WRITE_COMMAND_8 0xFF 
+			ST7701INIT_WRITE_BYTES 5 0x77 0x01 0x00 0x00 0x00 
+
+			ST7701INIT_WRITE_COMMAND_8 0x29 
+			ST7701INIT_END_WRITE
+			ST7701INIT_DELAY 20
+		>;
+	};
 };
 
 &pio{
@@ -96,10 +237,17 @@
 	};
 
 	rtp_pins_01: rtp-pins-01 {
-			pins = "PA0", "PA1";
-			function = "rtp";
-		};
-
+		pins = "PA0", "PA1";
+		function = "rtp";
+};
+	
+	lcd_rgb565_no_de_pins: lcd-rgb565-no-de-pins {
+		pins = "PD1", "PD2", "PD3", "PD4", "PD5",
+			"PD6", "PD7", "PD8", "PD9", "PD10", "PD11", 
+			"PD13", "PD14", "PD15", "PD16", "PD17",
+			"PD18", "PD20", "PD21";
+		function = "lcd";
+	};
 };
 
 &pwm {
@@ -264,7 +412,7 @@
 
 &tcon0 {
 	pinctrl-names = "default";
-	pinctrl-0 = <&lcd_rgb565_pins>;
+	pinctrl-0 = <&lcd_rgb565_no_de_pins>;
 	status = "okay";
 };
 

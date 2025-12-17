@@ -452,7 +452,7 @@ CONFIG_USE_BOOTARGS=y
 CONFIG_BOOTARGS="console=ttyS0,115200 console=tty0 panic=5 rootwait mtdparts=spi0.0:1M(u-boot)ro,128K(dtb)ro,5124K(kernel)ro,-(rootfs) root=ubi0:rootfs earlyprintk rw rootfstype=ubifs ubi.mtd=3 fbcon=rotate:2"
 # CONFIG_BOOTARGS_SUBST is not set
 CONFIG_USE_BOOTCOMMAND=y
-CONFIG_BOOTCOMMAND="setenv verify n;mtd read spi-nand0 0x80C00000 0x100000 0x4000; mtd read spi-nand0 0x80008000 0x120000 0x500000; bootz 0x80008000 - 0x80C00000"
+CONFIG_BOOTCOMMAND="setenv verify n;mtd read spi-nand0 0x80C00000 0x100000 0x6000; mtd read spi-nand0 0x80008000 0x120000 0x500000; bootz 0x80008000 - 0x80C00000"
 CONFIG_USE_PREBOOT=y
 CONFIG_PREBOOT=""
 CONFIG_DEFAULT_FDT_FILE=""
