@@ -9,6 +9,7 @@
 电子通行证文件相关位于：buildroot-epass/board/rhodesisland/epass目录下
 
 ## 如何构建系统
+以下指令仅在ubuntu 24.04测试可用，如果您使用了其他发行版可能有所不同，请自行解决。
 
 ### 安装工具包
 ``` shell
