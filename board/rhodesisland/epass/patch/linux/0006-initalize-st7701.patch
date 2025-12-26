@@ -312,4 +312,20 @@
 +MODULE_DESCRIPTION("bitbanging ST7701 initialization over GPIO");
 +MODULE_LICENSE("GPL");
 +MODULE_ALIAS("platform:st7701init");
-
+--- a/drivers/staging/Makefile
++++ b/drivers/staging/Makefile
+@@ -53,3 +53,5 @@
+ obj-$(CONFIG_USB_WUSB)		+= wusbcore/
+ obj-$(CONFIG_EXFAT_FS)		+= exfat/
+ obj-$(CONFIG_QLGE)		+= qlge/
++obj-$(CONFIG_PRISM2_USB)	+= wlan-ng/
++obj-$(CONFIG_SHIROGANE)		+= shirogane/
+--- a/drivers/staging/Kconfig
++++ b/drivers/staging/Kconfig
+@@ -125,4 +125,6 @@
+ 
+ source "drivers/staging/qlge/Kconfig"
+ 
++source "drivers/staging/shirogane/Kconfig"
++
+ endif # STAGING

@@ -1,0 +1,369 @@
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -71,9 +71,9 @@
+ {
+ 	DRM_DEBUG_DRIVER("Committing changes\n");
+ 
+-	regmap_write(engine->regs, SUN4I_BACKEND_REGBUFFCTL_REG,
+-		     SUN4I_BACKEND_REGBUFFCTL_AUTOLOAD_DIS |
+-		     SUN4I_BACKEND_REGBUFFCTL_LOADCTL);
++	// regmap_write(engine->regs, SUN4I_BACKEND_REGBUFFCTL_REG,
++	// 	     SUN4I_BACKEND_REGBUFFCTL_AUTOLOAD_DIS |
++	// 	     SUN4I_BACKEND_REGBUFFCTL_LOADCTL);
+ }
+ 
+ void sun4i_backend_layer_enable(struct sun4i_backend *backend,
+@@ -350,6 +350,7 @@
+ 	u32 lo_paddr, hi_paddr;
+ 	dma_addr_t paddr;
+ 
++
+ 	/* Set the line width */
+ 	DRM_DEBUG_DRIVER("Layer line width: %d bits\n", fb->pitches[0] * 8);
+ 	regmap_write(backend->engine.regs,
+@@ -363,6 +364,9 @@
+ 	if (fb->format->is_yuv)
+ 		return sun4i_backend_update_yuv_buffer(backend, fb, paddr);
+ 
++	// printk(KERN_INFO "srgn: layer id Ground Truth: %d,paddr=%px\n", layer, paddr);
++
++
+ 	/* Write the 32 lower bits of the address (in bits) */
+ 	lo_paddr = paddr << 3;
+ 	DRM_DEBUG_DRIVER("Setting address lower bits to 0x%x\n", lo_paddr);
+@@ -815,6 +819,7 @@
+ 		drm->dev->dma_pfn_offset = PHYS_PFN_OFFSET;
+ 	}
+ 
++
+ 	backend->engine.node = dev->of_node;
+ 	backend->engine.ops = &sun4i_backend_engine_ops;
+ 	backend->engine.id = sun4i_backend_of_get_id(dev->of_node);
+@@ -896,8 +901,8 @@
+ 		regmap_write(backend->engine.regs, i, 0);
+ 
+ 	/* Disable registers autoloading */
+-	regmap_write(backend->engine.regs, SUN4I_BACKEND_REGBUFFCTL_REG,
+-		     SUN4I_BACKEND_REGBUFFCTL_AUTOLOAD_DIS);
++	// regmap_write(backend->engine.regs, SUN4I_BACKEND_REGBUFFCTL_REG,
++	// 	     SUN4I_BACKEND_REGBUFFCTL_AUTOLOAD_DIS);
+ 
+ 	/* Enable the backend */
+ 	regmap_write(backend->engine.regs, SUN4I_BACKEND_MODCTL_REG,
+@@ -927,6 +932,9 @@
+ 
+ 	backend->quirks = quirks;
+ 
++	// printk(KERN_INFO "srgn:backend Ground Truth: %px\n", backend);
++	// printk(KERN_INFO "srgn:frontend Ground Truth: %px\n", backend->frontend);
++
+ 	return 0;
+ 
+ err_disable_ram_clk:
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.c
+@@ -26,7 +26,12 @@
+ #include "sun4i_frontend.h"
+ #include "sun4i_framebuffer.h"
+ #include "sun4i_tcon.h"
++#include "sunxi_engine.h"
+ #include "sun8i_tcon_top.h"
++#include "uapi/drm/srgn_drm.h"
++
++#include <linux/types.h>
++
+ 
+ static int drm_sun4i_gem_dumb_create(struct drm_file *file_priv,
+ 				     struct drm_device *drm,
+@@ -40,6 +45,235 @@
+ 
+ DEFINE_DRM_GEM_CMA_FOPS(sun4i_drv_fops);
+ 
++#if 0
++	#define SRGN_DEBUG_PRINT(fmt, ...) printk(KERN_INFO "srgn: " fmt, ##__VA_ARGS__)
++#else
++	#define SRGN_DEBUG_PRINT(fmt, ...)
++#endif
++
++static int srgn_get_user_first_phys(unsigned long uaddr, phys_addr_t *out_phys)
++{
++    struct page *page;
++    int ret;
++    unsigned long addr = uaddr & PAGE_MASK;
++    unsigned long offset = uaddr & ~PAGE_MASK;
++	struct vm_area_struct *vma;
++	unsigned long original_flags;
++
++	vma = find_vma(current->mm, addr);
++	if (!vma || addr < vma->vm_start) {
++		SRGN_DEBUG_PRINT("no vma for addr 0x%lx\n", addr);
++	} else {
++		SRGN_DEBUG_PRINT("vma: start=0x%lx end=0x%lx flags=0x%lx\n",
++				vma->vm_start, vma->vm_end, vma->vm_flags);
++	}
++
++	// some very,very,very dirty hack to get the physical address from the user address
++	// because drm buffer was allocate with VM_IO and VM_PFNMAP flags,
++	// which is not allowed to GUP.
++	original_flags = vma->vm_flags;
++	vma->vm_flags &= ~VM_PFNMAP;
++	vma->vm_flags &= ~VM_IO;
++
++
++    if (!out_phys)
++        return -EINVAL;
++
++
++    ret = get_user_pages_unlocked(addr, 1, &page, 0);
++    if (ret < 0){
++		SRGN_DEBUG_PRINT("srgn_get_user_first_phys get_user_pages failed(%d)\n", ret);
++        return ret;
++	}
++    if (ret != 1){
++		SRGN_DEBUG_PRINT("srgn_get_user_first_phys get_user_pages failed length not corr:%d\n",ret);
++        return -EFAULT;
++	}
++
++    *out_phys = page_to_phys(page) + offset;
++
++    put_page(page);
++	vma->vm_flags = original_flags;
++
++    return 0;
++}
++
++
++static unsigned long uaddr_cache[128];
++static phys_addr_t phys_addr_cache[128];
++static int cache_count = 0;
++
++static int srgn_get_phy_from_cache(unsigned long uaddr, phys_addr_t *out_phys){
++	int i;
++
++	for (i = 0; i < cache_count; i++){
++		if (uaddr_cache[i] == uaddr){
++			SRGN_DEBUG_PRINT("get from cache: uaddr=%px, phys_addr=%px\n", uaddr, phys_addr_cache[i]);
++			*out_phys = phys_addr_cache[i];
++			return 0;
++		}
++	}
++	return -EINVAL;
++
++}
++
++static int srgn_add_to_cache(unsigned long uaddr, phys_addr_t phys_addr){
++	if (cache_count >= 128){
++		return -ENOMEM;
++	}
++	uaddr_cache[cache_count] = uaddr;
++	phys_addr_cache[cache_count] = phys_addr;
++	cache_count++;
++	SRGN_DEBUG_PRINT("add to cache: uaddr=%px, phys_addr=%px, cache count=%d\n", uaddr, phys_addr, cache_count);
++	return 0;
++}
++
++static int srgn_get_phy_addr(unsigned long uaddr, phys_addr_t *out_phys)
++{
++	int ret;
++	ret = srgn_get_phy_from_cache(uaddr, out_phys);
++	if (ret == 0){
++		return 0;
++	}
++	ret = srgn_get_user_first_phys(uaddr, out_phys);
++	if (ret == 0){
++		srgn_add_to_cache(uaddr, *out_phys);
++	}
++	return ret;
++}
++
++static int srgn_reset_cache(struct drm_device *drm, void *data, struct drm_file *file)
++{
++	printk(KERN_INFO "srgn: reset cache\n");
++	cache_count = 0;
++	return 0;
++}
++
++static void srgn_set_backend_buffer(struct sun4i_backend *backend, phys_addr_t addr, int layer){
++	u32 lo_paddr, hi_paddr;
++	/* Write the 32 lower bits of the address (in bits) */
++	dma_addr_t paddr = addr;
++
++	paddr -= PHYS_OFFSET;
++	lo_paddr = paddr << 3;
++	SRGN_DEBUG_PRINT("Setting address lower bits to 0x%x\n", lo_paddr);
++	regmap_write(backend->engine.regs,
++		     SUN4I_BACKEND_LAYFB_L32ADD_REG(layer),
++		     lo_paddr);
++
++	/* And the upper bits */
++	hi_paddr = paddr >> 29;
++	SRGN_DEBUG_PRINT("Setting address high bits to 0x%x\n", hi_paddr);
++	regmap_update_bits(backend->engine.regs, SUN4I_BACKEND_LAYFB_H4ADD_REG,
++			   SUN4I_BACKEND_LAYFB_H4ADD_MSK(layer),
++			   SUN4I_BACKEND_LAYFB_H4ADD(layer, hi_paddr));
++}
++
++static void srgn_set_frontend_buffer(struct sun4i_frontend *frontend, phys_addr_t ch0_addr, phys_addr_t ch1_addr, phys_addr_t ch2_addr,int channel_cnt){
++	
++	dma_addr_t paddr = ch0_addr;
++	paddr -= PHYS_OFFSET;
++	SRGN_DEBUG_PRINT("Setting buffer #0 address to %pad\n", &paddr);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR0_REG, paddr);
++
++	if (channel_cnt > 1) {
++		paddr = ch1_addr;
++		paddr -= PHYS_OFFSET;
++		SRGN_DEBUG_PRINT("Setting buffer #1 address to %pad\n", &paddr);
++		regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR1_REG,
++			     paddr);
++	}
++
++	if (channel_cnt > 2) {
++		paddr = ch2_addr;
++		paddr -= PHYS_OFFSET;
++		SRGN_DEBUG_PRINT("Setting buffer #2 address to %pad\n", &paddr);
++		regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR2_REG,
++			     paddr);
++	}
++
++	regmap_write_bits(frontend->regs, SUN4I_FRONTEND_FRM_CTRL_REG,
++		SUN4I_FRONTEND_FRM_CTRL_REG_RDY,
++		SUN4I_FRONTEND_FRM_CTRL_REG_RDY);
++}
++int srgn_mount_fb(struct drm_device *drm, void *data, struct drm_file *file)
++{
++	struct drm_srgn_mount_fb *arg = data;
++	struct sun4i_drv *drv = drm->dev_private;
++	struct sunxi_engine *engine;
++	struct sun4i_frontend *frontend;
++	struct sun4i_backend *backend;
++	struct sun4i_tcon *tcon;
++
++	int ret;
++
++	phys_addr_t ch0_addr = NULL;
++	phys_addr_t ch1_addr = NULL;
++	phys_addr_t ch2_addr = NULL;
++
++	struct list_head *entry;
++
++	// theres only 1 engine,1 fe 1 tcon in f1c100s.
++	list_for_each(entry, &drv->engine_list) {
++		engine = container_of(entry, struct sunxi_engine, list);
++		backend = engine_to_sun4i_backend(engine);
++	}
++	list_for_each(entry, &drv->frontend_list) {
++		frontend = container_of(entry, struct sun4i_frontend, list);
++	}
++	list_for_each(entry, &drv->tcon_list) {
++		tcon = container_of(entry, struct sun4i_tcon, list);
++	}
++
++	SRGN_DEBUG_PRINT("ioctl_backend: %px\n", backend);
++	SRGN_DEBUG_PRINT("ioctl_frontend: %px\n", frontend);
++	SRGN_DEBUG_PRINT("ioctl_tcon: %px\n", tcon);
++
++	SRGN_DEBUG_PRINT("sizeof(arg)=%ld\n", sizeof(struct drm_srgn_mount_fb));
++	SRGN_DEBUG_PRINT("srgn_mount_fb: layer_id=%d, type=%d, ch0_addr=%px, ch1_addr=%px, ch2_addr=%px\n",
++		arg->layer_id, arg->type, arg->ch0_addr, arg->ch1_addr, arg->ch2_addr);
++
++	
++	if (arg->type == DRM_SRGN_MOUNT_FB_TYPE_YUV) {
++		SRGN_DEBUG_PRINT("ioctl_yuv: true\n");
++		ret = srgn_get_phy_addr(arg->ch0_addr,&ch0_addr);
++		if (ret < 0) {
++			SRGN_DEBUG_PRINT("YUV ioctl get ch0_addr failed\n");
++			return ret;
++		}
++		ret = srgn_get_phy_addr(arg->ch1_addr,&ch1_addr);
++		if (ret < 0) {
++			SRGN_DEBUG_PRINT("YUV ioctl get ch1_addr failed\n");
++			return ret;
++		}
++		SRGN_DEBUG_PRINT("YUV ioctl get ch0_addr=%px, ch1_addr=%px\n", ch0_addr, ch1_addr);
++
++		srgn_set_frontend_buffer(frontend, ch0_addr, ch1_addr, NULL, 2);
++	} else {
++		SRGN_DEBUG_PRINT("ioctl_yuv: false\n");
++		ret = srgn_get_phy_addr(arg->ch0_addr,&ch0_addr);
++		if (ret < 0) {
++			SRGN_DEBUG_PRINT("NORMAL ioctl get ch0_addr failed\n");
++			return ret;
++		}
++
++		SRGN_DEBUG_PRINT("ioctl get ch0_addr=%px\n", ch0_addr);
++
++		srgn_set_backend_buffer(backend, ch0_addr, arg->layer_id);
++
++	}
++
++
++	return 0;
++}
++
++static const struct drm_ioctl_desc srgn_sun4i_ioctls[] = {
++	DRM_IOCTL_DEF_DRV(SRGN_MOUNT_FB, srgn_mount_fb,
++		DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(SRGN_RESET_CACHE, srgn_reset_cache,
++		DRM_RENDER_ALLOW),
++};
++
+ static struct drm_driver sun4i_drv_driver = {
+ 	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
+ 
+@@ -54,6 +288,9 @@
+ 	/* GEM Operations */
+ 	DRM_GEM_CMA_VMAP_DRIVER_OPS,
+ 	.dumb_create		= drm_sun4i_gem_dumb_create,
++	
++	.ioctls		= srgn_sun4i_ioctls,
++	.num_ioctls = ARRAY_SIZE(srgn_sun4i_ioctls),
+ };
+ 
+ static int sun4i_drv_bind(struct device *dev)
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.h
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.h
+@@ -12,11 +12,13 @@
+ #include <linux/clk.h>
+ #include <linux/list.h>
+ #include <linux/regmap.h>
++#include "sun4i_backend.h"
+ 
+ struct sun4i_drv {
+ 	struct list_head	engine_list;
+ 	struct list_head	frontend_list;
+ 	struct list_head	tcon_list;
++	
+ };
+ 
+ #endif /* _SUN4I_DRV_H_ */
+--- a/include/uapi/drm/srgn_drm.h
++++ b/include/uapi/drm/srgn_drm.h
+@@ -0,0 +1,27 @@
++// sync with kernel driver
++#ifndef _UAPI_SRGN_DRM_H_
++#define _UAPI_SRGN_DRM_H_
++
++#include <linux/types.h>
++#include <drm/drm.h>
++
++#define DRM_SRGN_MOUNT_FB 0x00
++#define DRM_SRGN_RESET_CACHE 0x01
++
++
++#define DRM_SRGN_MOUNT_FB_TYPE_NORMAL 0x00
++#define DRM_SRGN_MOUNT_FB_TYPE_YUV 0x01
++
++#define DRM_IOCTL_SRGN_MOUNT_FB DRM_IOW(DRM_COMMAND_BASE + DRM_SRGN_MOUNT_FB, struct drm_srgn_mount_fb)
++#define DRM_IOCTL_SRGN_RESET_CACHE DRM_IO(DRM_COMMAND_BASE + DRM_SRGN_RESET_CACHE)
++
++
++struct drm_srgn_mount_fb {
++	__u32 layer_id;
++    __u32 type;
++    __u32 ch0_addr;
++    __u32 ch1_addr;
++    __u32 ch2_addr;
++};
++
++#endif
