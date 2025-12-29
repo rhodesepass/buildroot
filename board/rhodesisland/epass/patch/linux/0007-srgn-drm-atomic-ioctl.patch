@@ -62,7 +62,15 @@
  err_disable_ram_clk:
 --- a/drivers/gpu/drm/sun4i/sun4i_drv.c
 +++ b/drivers/gpu/drm/sun4i/sun4i_drv.c
-@@ -26,7 +26,12 @@
+@@ -6,6 +6,7 @@
+  * Maxime Ripard <maxime.ripard@free-electrons.com>
+  */
+ 
++#include "sun4i_backend.h"
+ #include <linux/component.h>
+ #include <linux/kfifo.h>
+ #include <linux/module.h>
+@@ -26,7 +27,12 @@
  #include "sun4i_frontend.h"
  #include "sun4i_framebuffer.h"
  #include "sun4i_tcon.h"
@@ -75,7 +83,7 @@
  
  static int drm_sun4i_gem_dumb_create(struct drm_file *file_priv,
  				     struct drm_device *drm,
-@@ -40,6 +45,255 @@
+@@ -40,6 +46,285 @@
  
  DEFINE_DRM_GEM_CMA_FOPS(sun4i_drv_fops);
  
@@ -183,72 +191,108 @@
 +	return 0;
 +}
 +
-+static void srgn_set_backend_buffer(struct sun4i_backend *backend, phys_addr_t addr, int layer){
-+	u32 lo_paddr, hi_paddr;
-+	/* Write the 32 lower bits of the address (in bits) */
-+	dma_addr_t paddr = addr;
 +
-+	paddr -= PHYS_OFFSET;
-+	lo_paddr = paddr << 3;
++static int srgn_atomic_commit_mount_fb_normal(struct sun4i_backend *backend, struct drm_srgn_atomic_commit_data *data)
++{
++	phys_addr_t phys_addr;
++	u32 lo_paddr, hi_paddr;
++	uint32_t layer = data->layer_id;
++
++	int ret;
++
++	ret = srgn_get_phy_addr(data->arg0, &phys_addr);
++	if (ret < 0) {
++		return ret;
++	}
++
++	/* Write the 32 lower bits of the address (in bits) */
++	phys_addr -= PHYS_OFFSET;
++	lo_paddr = phys_addr << 3;
 +	SRGN_DEBUG_PRINT("Setting address lower bits to 0x%x\n", lo_paddr);
 +	regmap_write(backend->engine.regs,
 +		     SUN4I_BACKEND_LAYFB_L32ADD_REG(layer),
 +		     lo_paddr);
 +
 +	/* And the upper bits */
-+	hi_paddr = paddr >> 29;
++	hi_paddr = phys_addr >> 29;
 +	SRGN_DEBUG_PRINT("Setting address high bits to 0x%x\n", hi_paddr);
 +	regmap_update_bits(backend->engine.regs, SUN4I_BACKEND_LAYFB_H4ADD_REG,
 +			   SUN4I_BACKEND_LAYFB_H4ADD_MSK(layer),
 +			   SUN4I_BACKEND_LAYFB_H4ADD(layer, hi_paddr));
++
++	return 0;
 +}
 +
-+static void srgn_set_frontend_buffer(struct sun4i_frontend *frontend, phys_addr_t ch0_addr, phys_addr_t ch1_addr, phys_addr_t ch2_addr,int channel_cnt){
-+	
-+	dma_addr_t paddr = ch0_addr;
-+	paddr -= PHYS_OFFSET;
-+	SRGN_DEBUG_PRINT("Setting buffer #0 address to %pad\n", &paddr);
-+	regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR0_REG, paddr);
++static int srgn_atomic_commit_mount_fb_yuv(struct sun4i_frontend *frontend, struct drm_srgn_atomic_commit_data *data)
++{
++	phys_addr_t phys_addr_y, phys_addr_uv;
++	phys_addr_t phys_addr;
 +
-+	if (channel_cnt > 1) {
-+		paddr = ch1_addr;
-+		paddr -= PHYS_OFFSET;
-+		SRGN_DEBUG_PRINT("Setting buffer #1 address to %pad\n", &paddr);
-+		regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR1_REG,
-+			     paddr);
++	int ret;
++
++	ret = srgn_get_phy_addr(data->arg0, &phys_addr_y);
++	if (ret < 0) {
++		return ret;
++	}
++	ret = srgn_get_phy_addr(data->arg1, &phys_addr_uv);
++	if (ret < 0) {
++		return ret;
 +	}
 +
-+	if (channel_cnt > 2) {
-+		paddr = ch2_addr;
-+		paddr -= PHYS_OFFSET;
-+		SRGN_DEBUG_PRINT("Setting buffer #2 address to %pad\n", &paddr);
-+		regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR2_REG,
-+			     paddr);
-+	}
++	phys_addr = phys_addr_y;
++	phys_addr -= PHYS_OFFSET;
++	SRGN_DEBUG_PRINT("Setting buffer #0 address to %pad\n", &phys_addr);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR0_REG, phys_addr);
++
++	phys_addr = phys_addr_uv;
++	phys_addr -= PHYS_OFFSET;
++	SRGN_DEBUG_PRINT("Setting buffer #1 address to %pad\n", &phys_addr);
++	regmap_write(frontend->regs, SUN4I_FRONTEND_BUF_ADDR1_REG,
++		phys_addr);
 +
 +	regmap_write_bits(frontend->regs, SUN4I_FRONTEND_FRM_CTRL_REG,
 +		SUN4I_FRONTEND_FRM_CTRL_REG_RDY,
 +		SUN4I_FRONTEND_FRM_CTRL_REG_RDY);
++	
++	return 0;
 +}
-+int srgn_mount_fb(struct drm_device *drm, void *data, struct drm_file *file)
++
++static int srgn_atomic_commit_mount_set_coord(struct sun4i_backend *backend, struct drm_srgn_atomic_commit_data *data){
++	regmap_write(backend->engine.regs, SUN4I_BACKEND_LAYCOOR_REG(data->layer_id), data->arg0);
++	return 0;
++}
++
++static int srgn_atomic_commit_mount_set_alpha(struct sun4i_backend *backend, struct drm_srgn_atomic_commit_data *data){
++	uint32_t alpha = data->arg0 & 0xff;
++	uint32_t layer = data->layer_id;
++	uint32_t val = SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA(alpha);
++	if (alpha != 255)
++		val |= SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA_EN;
++	regmap_update_bits(backend->engine.regs,
++			   SUN4I_BACKEND_ATTCTL_REG0(layer),
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA_MASK |
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA_EN,
++			   val);
++	return 0;
++}
++
++int srgn_atomic_commit(struct drm_device *drm, void *data, struct drm_file *file)
 +{
-+	struct drm_srgn_mount_fb *kreq = data;
++	struct drm_srgn_atomic_commit *kreq = data;
 +	struct sun4i_drv *drv = drm->dev_private;
 +	static struct sunxi_engine *engine;
 +	static struct sun4i_frontend *frontend;
 +	static struct sun4i_backend *backend;
 +	static struct sun4i_tcon *tcon;
-+	struct drm_srgn_mount_fb_data kcmd[4] = {0};
-+	struct drm_srgn_mount_fb_data *arg;
++
++	// 3 io req max for 4 layers,
++	struct drm_srgn_atomic_commit_data kcmd[12] = {0};
++	struct drm_srgn_atomic_commit_data* arg;
 +
 +	static bool first_time = true;
-+	size_t sz;
 +	int ret;
 +	int i;
 +
-+	phys_addr_t ch0_addr = NULL;
-+	phys_addr_t ch1_addr = NULL;
-+	phys_addr_t ch2_addr = NULL;
 +
 +	struct list_head *entry;
 +
@@ -274,64 +318,58 @@
 +
 +	SRGN_DEBUG_PRINT("sizeof(arg)=%ld\n", kreq->size);
 +
-+	if(kreq->size > 4){
-+		printk(KERN_ERR "srgn: size > 4\n");
++	if(kreq->size > 12){
++		printk(KERN_ERR "srgn: size > 12\n");
 +		return -EINVAL;
 +	}
-+	if (copy_from_user(kcmd, (void __user *)kreq->data, kreq->size * sizeof(struct drm_srgn_mount_fb_data))) {
++	if (copy_from_user(kcmd, (void __user *)kreq->data, kreq->size * sizeof(struct drm_srgn_atomic_commit_data))) {
 +		printk(KERN_ERR "srgn: copy_from_user failed\n");
 +        return -EFAULT;
 +    }
 +	
 +	for (i=0; i<kreq->size; i++) {
 +		arg = &kcmd[i];
-+		SRGN_DEBUG_PRINT("srgn_mount_fb: layer_id=%d, type=%d, ch0_addr=%px, ch1_addr=%px, ch2_addr=%px\n",
-+			arg->layer_id, arg->type, arg->ch0_addr, arg->ch1_addr, arg->ch2_addr);
-+
-+		if (arg->type == DRM_SRGN_MOUNT_FB_TYPE_YUV) {
-+			SRGN_DEBUG_PRINT("ioctl_yuv: true\n");
-+			ret = srgn_get_phy_addr(arg->ch0_addr,&ch0_addr);
-+			if (ret < 0) {
-+				SRGN_DEBUG_PRINT("YUV ioctl get ch0_addr failed\n");
-+				return ret;
-+			}
-+			ret = srgn_get_phy_addr(arg->ch1_addr,&ch1_addr);
-+			if (ret < 0) {
-+				SRGN_DEBUG_PRINT("YUV ioctl get ch1_addr failed\n");
-+				return ret;
-+			}
-+			SRGN_DEBUG_PRINT("YUV ioctl get ch0_addr=%px, ch1_addr=%px\n", ch0_addr, ch1_addr);
-+
-+			srgn_set_frontend_buffer(frontend, ch0_addr, ch1_addr, NULL, 2);
-+		} else {
-+			SRGN_DEBUG_PRINT("ioctl_yuv: false\n");
-+			ret = srgn_get_phy_addr(arg->ch0_addr,&ch0_addr);
-+			if (ret < 0) {
-+				SRGN_DEBUG_PRINT("NORMAL ioctl get ch0_addr failed\n");
-+				return ret;
-+			}
-+
-+			SRGN_DEBUG_PRINT("ioctl get ch0_addr=%px\n", ch0_addr);
-+
-+			srgn_set_backend_buffer(backend, ch0_addr, arg->layer_id);
-+
++		SRGN_DEBUG_PRINT("srgn_atomic_commit: layer_id=%d, type=%d, arg0=0x%x, arg1=0x%x, arg2=0x%x\n",
++			arg->layer_id, arg->type, arg->arg0, arg->arg1, arg->arg2);
++		switch(arg->type){
++			case DRM_SRGN_ATOMIC_COMMIT_MOUNT_FB_NORMAL:
++				ret = srgn_atomic_commit_mount_fb_normal(backend, arg);
++				break;
++			case DRM_SRGN_ATOMIC_COMMIT_MOUNT_FB_YUV:
++				ret = srgn_atomic_commit_mount_fb_yuv(frontend, arg);
++				break;
++			case DRM_SRGN_ATOMIC_COMMIT_MOUNT_SET_COORD:
++				ret = srgn_atomic_commit_mount_set_coord(backend, arg);
++				break;
++			case DRM_SRGN_ATOMIC_COMMIT_MOUNT_SET_ALPHA:
++				ret = srgn_atomic_commit_mount_set_alpha(backend, arg);
++				break;
++			default:
++				ret = -EINVAL;
++				break;
 +		}
++		if (ret < 0) {
++			printk(KERN_ERR "Error: srgn_atomic_commit: layer_id=%d, type=%d, arg0=%d, arg1=%d, arg2=%d failed\n",
++				arg->layer_id, arg->type, arg->arg0, arg->arg1, arg->arg2);
++			return ret;
++		}
++		
 +	}
 +
 +	return 0;
 +}
 +
 +static const struct drm_ioctl_desc srgn_sun4i_ioctls[] = {
-+	DRM_IOCTL_DEF_DRV(SRGN_MOUNT_FB, srgn_mount_fb,
++	DRM_IOCTL_DEF_DRV(SRGN_ATOMIC_COMMIT, srgn_atomic_commit,
 +		DRM_RENDER_ALLOW),
-+	DRM_IOCTL_DEF_DRV(SRGN_RESET_CACHE, srgn_reset_cache,
++	DRM_IOCTL_DEF_DRV(SRGN_RESET_FB_CACHE, srgn_reset_cache,
 +		DRM_RENDER_ALLOW),
 +};
 +
  static struct drm_driver sun4i_drv_driver = {
  	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
  
-@@ -54,6 +308,9 @@
+@@ -54,6 +339,9 @@
  	/* GEM Operations */
  	DRM_GEM_CMA_VMAP_DRIVER_OPS,
  	.dumb_create		= drm_sun4i_gem_dumb_create,
@@ -359,34 +397,49 @@
  #endif /* _SUN4I_DRV_H_ */
 --- a/include/uapi/drm/srgn_drm.h
 +++ b/include/uapi/drm/srgn_drm.h
-@@ -0,0 +1,32 @@
-+// sync with kernel driver
+@@ -0,0 +1,47 @@
 +#ifndef _UAPI_SRGN_DRM_H_
 +#define _UAPI_SRGN_DRM_H_
 +
 +#include <linux/types.h>
 +#include <drm/drm.h>
 +
-+#define DRM_SRGN_MOUNT_FB 0x00
-+#define DRM_SRGN_RESET_CACHE 0x01
++/* this is actually yet another atomic commit ,
++ * just like the atomic commit ioctl in drm,
++ * drm ioctl will do full modeset(incl. initalize defe registers,....)
++ * which is too slow
++ */ 
 +
 +
-+#define DRM_SRGN_MOUNT_FB_TYPE_NORMAL 0x00
-+#define DRM_SRGN_MOUNT_FB_TYPE_YUV 0x01
-+
-+#define DRM_IOCTL_SRGN_MOUNT_FB DRM_IOW(DRM_COMMAND_BASE + DRM_SRGN_MOUNT_FB, struct drm_srgn_mount_fb)
-+#define DRM_IOCTL_SRGN_RESET_CACHE DRM_IO(DRM_COMMAND_BASE + DRM_SRGN_RESET_CACHE)
++#define DRM_SRGN_ATOMIC_COMMIT 0x00
++#define DRM_SRGN_RESET_FB_CACHE 0x01
 +
 +
-+struct drm_srgn_mount_fb_data {
-+       __u32 layer_id;
++// arg0: fb address(in userspace)
++#define DRM_SRGN_ATOMIC_COMMIT_MOUNT_FB_NORMAL 0x00
++// arg0: fb Y address(in userspace)
++// arg1: fb UV address(in userspace)
++#define DRM_SRGN_ATOMIC_COMMIT_MOUNT_FB_YUV 0x01
++// arg0: y<<16 | x, y,x is in two's complement form,pixel
++#define DRM_SRGN_ATOMIC_COMMIT_MOUNT_SET_COORD 0x02
++// arg0: alpha, 255 = no alpha.
++// set alpha = 255 before use pixel-wise alpha.
++#define DRM_SRGN_ATOMIC_COMMIT_MOUNT_SET_ALPHA 0x03
++
++
++#define DRM_IOCTL_SRGN_ATOMIC_COMMIT DRM_IOW(DRM_COMMAND_BASE + DRM_SRGN_ATOMIC_COMMIT, struct drm_srgn_atomic_commit)
++#define DRM_IOCTL_SRGN_RESET_FB_CACHE DRM_IO(DRM_COMMAND_BASE + DRM_SRGN_RESET_FB_CACHE)
++
++
++struct drm_srgn_atomic_commit_data {
++    __u32 layer_id;
 +    __u32 type;
-+    __u32 ch0_addr;
-+    __u32 ch1_addr;
-+    __u32 ch2_addr;
++    __u32 arg0;
++    __u32 arg1;
++    __u32 arg2;
 +};
 +
-+struct drm_srgn_mount_fb {
++struct drm_srgn_atomic_commit {
 +    __u32 size;
 +    __u32 data;
 +};
