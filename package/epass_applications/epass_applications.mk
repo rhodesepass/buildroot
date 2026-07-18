@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-EPASS_APPLICATIONS_VERSION = 69a49204dd43109ecfd0e45f07fcaca0f34fd068
+EPASS_APPLICATIONS_VERSION = a7ea4d1b6ac701168695fa09c722c67f4874297f
 EPASS_APPLICATIONS_SITE = $(call github,rhodesepass,epass-applications,$(EPASS_APPLICATIONS_VERSION))
 EPASS_APPLICATIONS_DEPENDENCIES = \
 	dosfstools \
