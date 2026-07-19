@@ -5,7 +5,7 @@
 ################################################################################
 
 
-EPASS_DRM_APP_VERSION = 0cea8ba016970f6a9eefb631d13332bb06f72bcd
+EPASS_DRM_APP_VERSION = 59e4b53e2189a3ac5b58300370113212ee55d586
 EPASS_DRM_APP_SITE = $(call github,rhodesepass,drm_app_neo,$(EPASS_DRM_APP_VERSION))
 # epass-fonts: 提供 pkg-config 'epass-fonts', app 构建期据此取共享字体目录,
 # 不再自带字体 (字体由 epass-fonts 包装到 /usr/share/fonts/epass)。

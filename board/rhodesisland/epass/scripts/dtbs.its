@@ -214,5 +214,12 @@
             arch = "arm";
             compression = "none";
         };
+        fdt-ext-cvbs {
+            description = "TVE CVBS output extension overlay";
+            data = /incbin/("./dt/ext/cvbs.dtbo");
+            type = "flat_dt";
+            arch = "arm";
+            compression = "none";
+        };
     };
 };

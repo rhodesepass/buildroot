@@ -1,0 +1,173 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] drm/sun4i: tv: add suniv DAC frontend quirks
+
+The suniv (F1C100s/F1C200s) TVE core is register-compatible with the
+A10 one - the mode tables in the vendor BSP (de_tvec.c) match this
+driver's PORCH/LINE/LEVEL/burst/resync values bit for bit - but the
+DAC analog frontend differs:
+
+ - DAC0 (0x008) carries a single amplitude field at [23:17] and the
+   internal terminal resistance mode at [25:24]. The A10
+   resistance/gain fields at [21:16] and the clock-invert/enable bits
+   above bit 24 land in the middle of those fields, so the A10 value
+   programs a wrong amplitude and leaves the terminal mode at 0.
+ - There is only one DAC: the EN-register DAC map ([19:4]) and the
+   DAC1 amplitude register (0x024) do not exist. The vendor BSP never
+   touches either.
+
+Match the vendor BSP writes on suniv via a quirk keyed off the
+"allwinner,suniv-f1c100s-tv-encoder" compatible (already first in the
+device tree's compatible list): DAC0 = enable | amplitude 0x1c |
+37.5 ohm terminal mode, and skip the DAC map and DAC1 writes.
+
+--- a/drivers/gpu/drm/sun4i/sun4i_tv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tv.c
+@@ -10,6 +10,7 @@
+ #include <linux/component.h>
+ #include <linux/module.h>
+ #include <linux/of_address.h>
++#include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
+@@ -49,6 +50,18 @@
+ #define SUN4I_TVE_DAC0_INTERNAL_DAC_37_5_OHMS	SUN4I_TVE_DAC0_INTERNAL_DAC(3)
+ #define SUN4I_TVE_DAC0_DAC_EN(dac)		BIT(dac)
+ 
++/*
++ * The suniv (F1C100s/F1C200s) TVE core matches the A10 one register for
++ * register, but its DAC0 analog frontend is laid out differently: one
++ * amplitude field at [23:17] and the internal terminal resistance mode
++ * at [25:24]. The A10 resistance/gain fields, the DAC1 amplitude
++ * register and the EN-register DAC map do not exist - there is a single
++ * DAC. Field layout and values come from the vendor BSP (de_tvec.c,
++ * TVE_set_tv_mode).
++ */
++#define SUNIV_TVE_DAC0_AMPLITUDE(x)		(((x) & 0x7f) << 17)
++#define SUNIV_TVE_DAC0_INTERNAL_DAC_37_5_OHMS	(3 << 24)
++
+ #define SUN4I_TVE_NOTCH_REG		0x00c
+ #define SUN4I_TVE_NOTCH_DAC0_TO_DAC_DLY(dac, x)	((4 - (x)) << (dac * 3))
+ 
+@@ -166,6 +179,10 @@
+ 	const struct resync_parameters	*resync_params;
+ };
+ 
++struct sun4i_tv_quirks {
++	bool	suniv_dac;
++};
++
+ struct sun4i_tv {
+ 	struct drm_connector	connector;
+ 	struct drm_encoder	encoder;
+@@ -174,6 +191,8 @@
+ 	struct regmap		*regs;
+ 	struct reset_control	*reset;
+ 
++	const struct sun4i_tv_quirks	*quirks;
++
+ 	struct sun4i_drv	*drv;
+ };
+ 
+@@ -374,12 +393,13 @@
+ 	const struct tv_mode *tv_mode = sun4i_tv_find_tv_by_mode(mode);
+ 
+ 	/* Enable and map the DAC to the output */
+-	regmap_update_bits(tv->regs, SUN4I_TVE_EN_REG,
+-			   SUN4I_TVE_EN_DAC_MAP_MASK,
+-			   SUN4I_TVE_EN_DAC_MAP(0, 1) |
+-			   SUN4I_TVE_EN_DAC_MAP(1, 2) |
+-			   SUN4I_TVE_EN_DAC_MAP(2, 3) |
+-			   SUN4I_TVE_EN_DAC_MAP(3, 4));
++	if (!tv->quirks->suniv_dac)
++		regmap_update_bits(tv->regs, SUN4I_TVE_EN_REG,
++				   SUN4I_TVE_EN_DAC_MAP_MASK,
++				   SUN4I_TVE_EN_DAC_MAP(0, 1) |
++				   SUN4I_TVE_EN_DAC_MAP(1, 2) |
++				   SUN4I_TVE_EN_DAC_MAP(2, 3) |
++				   SUN4I_TVE_EN_DAC_MAP(3, 4));
+ 
+ 	/* Set PAL settings */
+ 	regmap_write(tv->regs, SUN4I_TVE_CFG0_REG,
+@@ -391,15 +411,21 @@
+ 		     SUN4I_TVE_CFG0_CORE_CONTROL_54M);
+ 
+ 	/* Configure the DAC for a composite output */
+-	regmap_write(tv->regs, SUN4I_TVE_DAC0_REG,
+-		     SUN4I_TVE_DAC0_DAC_EN(0) |
+-		     (tv_mode->dac3_en ? SUN4I_TVE_DAC0_DAC_EN(3) : 0) |
+-		     SUN4I_TVE_DAC0_INTERNAL_DAC_37_5_OHMS |
+-		     SUN4I_TVE_DAC0_CHROMA_0_75 |
+-		     SUN4I_TVE_DAC0_LUMA_0_4 |
+-		     SUN4I_TVE_DAC0_CLOCK_INVERT |
+-		     (tv_mode->dac_bit25_en ? BIT(25) : 0) |
+-		     BIT(30));
++	if (tv->quirks->suniv_dac)
++		regmap_write(tv->regs, SUN4I_TVE_DAC0_REG,
++			     SUN4I_TVE_DAC0_DAC_EN(0) |
++			     SUNIV_TVE_DAC0_AMPLITUDE(0x1c) |
++			     SUNIV_TVE_DAC0_INTERNAL_DAC_37_5_OHMS);
++	else
++		regmap_write(tv->regs, SUN4I_TVE_DAC0_REG,
++			     SUN4I_TVE_DAC0_DAC_EN(0) |
++			     (tv_mode->dac3_en ? SUN4I_TVE_DAC0_DAC_EN(3) : 0) |
++			     SUN4I_TVE_DAC0_INTERNAL_DAC_37_5_OHMS |
++			     SUN4I_TVE_DAC0_CHROMA_0_75 |
++			     SUN4I_TVE_DAC0_LUMA_0_4 |
++			     SUN4I_TVE_DAC0_CLOCK_INVERT |
++			     (tv_mode->dac_bit25_en ? BIT(25) : 0) |
++			     BIT(30));
+ 
+ 	/* Configure the sample delay between DAC0 and the other DAC */
+ 	regmap_write(tv->regs, SUN4I_TVE_NOTCH_REG,
+@@ -423,11 +449,12 @@
+ 		     SUN4I_TVE_LEVEL_BLANK(tv_mode->video_levels->blank) |
+ 		     SUN4I_TVE_LEVEL_BLACK(tv_mode->video_levels->black));
+ 
+-	regmap_write(tv->regs, SUN4I_TVE_DAC1_REG,
+-		     SUN4I_TVE_DAC1_AMPLITUDE(0, 0x18) |
+-		     SUN4I_TVE_DAC1_AMPLITUDE(1, 0x18) |
+-		     SUN4I_TVE_DAC1_AMPLITUDE(2, 0x18) |
+-		     SUN4I_TVE_DAC1_AMPLITUDE(3, 0x18));
++	if (!tv->quirks->suniv_dac)
++		regmap_write(tv->regs, SUN4I_TVE_DAC1_REG,
++			     SUN4I_TVE_DAC1_AMPLITUDE(0, 0x18) |
++			     SUN4I_TVE_DAC1_AMPLITUDE(1, 0x18) |
++			     SUN4I_TVE_DAC1_AMPLITUDE(2, 0x18) |
++			     SUN4I_TVE_DAC1_AMPLITUDE(3, 0x18));
+ 
+ 	regmap_write(tv->regs, SUN4I_TVE_CB_CR_LVL_REG,
+ 		     SUN4I_TVE_CB_CR_LVL_CB_BURST(tv_mode->burst_levels->cb) |
+@@ -554,6 +581,7 @@
+ 	if (!tv)
+ 		return -ENOMEM;
+ 	tv->drv = drv;
++	tv->quirks = of_device_get_match_data(dev);
+ 	dev_set_drvdata(dev, tv);
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+@@ -661,8 +689,23 @@
+ 	return 0;
+ }
+ 
++static const struct sun4i_tv_quirks sun4i_a10_tv_quirks = {
++	/* A10-style multi-DAC frontend */
++};
++
++static const struct sun4i_tv_quirks suniv_f1c100s_tv_quirks = {
++	.suniv_dac = true,
++};
++
+ static const struct of_device_id sun4i_tv_of_table[] = {
+-	{ .compatible = "allwinner,sun4i-a10-tv-encoder" },
++	{
++		.compatible = "allwinner,suniv-f1c100s-tv-encoder",
++		.data = &suniv_f1c100s_tv_quirks,
++	},
++	{
++		.compatible = "allwinner,sun4i-a10-tv-encoder",
++		.data = &sun4i_a10_tv_quirks,
++	},
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, sun4i_tv_of_table);

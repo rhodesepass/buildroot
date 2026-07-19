@@ -20,7 +20,7 @@
 #define LOW_THRESH       10      // 低于此电量红色闪烁
 #define POLL_BATTERY_MS  5000
 #define BLINK_MS         500     // 半周期 => 1Hz
-#define SHOW_MS          5000    // 常态按键后显示时长
+#define SHOW_MS          3000    // 常态按键后显示时长
 
 #define MAX_INPUTS 16
 
@@ -92,6 +92,26 @@ static int psy_charging(void)
 	if (read_file(p, buf, sizeof buf) < 0)
 		return 0;
 	return !strncmp(buf, "Charging", 8);
+}
+
+// epass_drm_app(app_360/app_720)自带电量显示;它在跑时 daemon 让位关掉 overlay
+static int app_running(void)
+{
+	glob_t g;
+	int found = 0;
+
+	if (glob("/proc/[0-9]*/comm", 0, NULL, &g))
+		return 0;
+	for (size_t i = 0; i < g.gl_pathc && !found; i++) {
+		char buf[64];
+
+		if (read_file(g.gl_pathv[i], buf, sizeof buf) < 0)
+			continue;
+		if (!strcmp(buf, "app_360\n") || !strcmp(buf, "app_720\n"))
+			found = 1;
+	}
+	globfree(&g);
+	return found;
 }
 
 // cardkb 是模块,开机时可能还没注册;input_n==0 时重扫一次即可补上
@@ -168,6 +188,8 @@ int main(void)
 
 	int capacity = psy_int("capacity", 100);
 	int charging = psy_charging();
+	int display_capacity = capacity;   // 显示用电量:未充电时只降不升
+	int app_up = app_running();
 	long next_batt = now_ms();
 	long show_until = 0;
 	long next_blink = 0;
@@ -179,19 +201,33 @@ int main(void)
 		if (tnow >= next_batt) {
 			capacity = psy_int("capacity", capacity);
 			charging = psy_charging();
+			// GAB 后端(cap_reliable==0)是 OCV 查表连续值,抖动大;
+			// 量化到四格(0/25/50/75/100),就近取整。AXP 是真库仑计,不动
+			if (!cap_reliable) {
+				capacity = (capacity + 12) / 25 * 25;
+				if (capacity > 100)
+					capacity = 100;
+			}
+			// 充电前假定电量只会往下掉:取最小值平滑后端(GAB/AXP)读数抖动;
+			// 充电时跟随实际值(会上升),充电结束后以当前值为新的下降基准
+			if (charging)
+				display_capacity = capacity;
+			else if (capacity < display_capacity)
+				display_capacity = capacity;
+			app_up = app_running();
 			if (input_n == 0)
 				open_inputs();
 			next_batt = tnow + POLL_BATTERY_MS;
 		}
 
-		struct hwc w = { 0, capacity, 1, 0, COLOR_WHITE };
+		struct hwc w = { 0, display_capacity, 1, 0, COLOR_WHITE };
 		long timeout = next_batt - tnow;
 
 		if (charging) {
 			w.charging = 1;
 			w.show_percent = cap_reliable ? 1 : 0;
 			w.enable = 1;
-		} else if (capacity < LOW_THRESH) {
+		} else if (display_capacity < LOW_THRESH) {
 			w.color = COLOR_RED;
 			if (tnow >= next_blink) {
 				blink_on = !blink_on;
@@ -210,6 +246,9 @@ int main(void)
 			show_until = 0;
 		}
 
+		if (app_up)
+			w.enable = 0;   // app 自带电量显示,daemon 让位
+
 		hwc_push(&w);
 
 		if (timeout < 0)
@@ -222,7 +261,7 @@ int main(void)
 			for (int i = 0; i < input_n; i++)
 				if ((inputs[i].revents & POLLIN) && drain_any_key(i))
 					key = 1;
-			if (key && !charging && capacity >= LOW_THRESH)
+			if (key && !charging && display_capacity >= LOW_THRESH)
 				show_until = now_ms() + SHOW_MS;
 		}
 	}
