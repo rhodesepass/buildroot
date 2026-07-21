@@ -52,6 +52,7 @@ userspace daemon; the driver itself does not read the GPADC.
 +#define BAT_HWC_PALETTE_OFF	0x1600
 +#define BAT_HWC_DEFAULT_COLOR	0xffffffffu
 +#define BAT_HWC_FALLBACK_W	720	/* used until DISSIZE is programmed */
++#define BAT_HWC_FALLBACK_H	640	/* ditto, height (yflip placement) */
 +
 +struct battery_hwc {
 +	struct sun4i_backend	*backend;
@@ -213,8 +214,8 @@ userspace daemon; the driver itself does not read the GPADC.
 +	static u32 pat[BAT_HWC_WORDS];
 +	struct sun4i_backend *backend = bat_hwc.backend;
 +	struct regmap *regs;
-+	u32 dissize, w;
-+	int x, y, i;
++	u32 dissize, w, h;
++	int x, y, i, r;
 +
 +	if (!backend)
 +		return;
@@ -232,10 +233,23 @@ userspace daemon; the driver itself does not read the GPADC.
 +	w = (dissize & 0xffff) + 1;
 +	if (w <= BAT_HWC_W)
 +		w = BAT_HWC_FALLBACK_W;
++	h = (dissize >> 16) + 1;
++	if (h <= BAT_HWC_H)
++		h = BAT_HWC_FALLBACK_H;
 +	x = w - BAT_HWC_W - BAT_HWC_PAD;
-+	y = BAT_HWC_PAD;
++	/*
++	 * 整机 180° 里的 Y 分量:layer 靠负 stride 倒扫、面板 SDIR 只补 X,
++	 * HWC 是 blender 上的独立块这两条都够不着,得自己补——位置绕中线
++	 * 映射到底部,pattern 内容在下面上下翻转。X 由面板 SDIR 管,不动。
++	 */
++	if (backend->yflip)
++		y = h - BAT_HWC_H - BAT_HWC_PAD;
++	else
++		y = BAT_HWC_PAD;
 +	if (x < 0)
 +		x = 0;
++	if (y < 0)
++		y = 0;
 +
 +	/* 64x64, 1bpp (HWCFB: Ysize=01<<4, Xsize=01<<2, bpp=00) */
 +	regmap_write(regs, SUN4I_BACKEND_HWCFBCTL_REG, (1 << 4) | (1 << 2));

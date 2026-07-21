@@ -1,0 +1,112 @@
+sun4i-backend: srgn,scanout-yflip 负 stride 扫描翻转
+
+DEBE 行地址累加器只在低 32 位回绕(板上实测,H4ADD 是静态高位不吃
+进位):层地址指向最后一行、LAYLINEWIDTH 写 -(pitch*8) 补码,扫描
+即逐行倒序,零带宽零 CPU 成本的 Y 翻转。同时把各层 LAYCOOR 的 Y
+坐标绕水平中线映射(y' = vdisplay - y - h):非全屏层(overlay、
+部分刷新脏矩形)内容翻了位置也得翻,两者合起来才是整屏 180° 里的
+Y 分量。
+
+设备树 be0 节点布尔属性 srgn,scanout-yflip 常开启用(倒装面板的
+screen overlay 里设置,如 boe)。内容翻转只作用于 BE 直接 DMA 的
+RGB/C8 层;packed-YUV 层不处理,frontend 喂的视频层内容由 SDROT
+V-mirror(cedrus rotate 节点 V4L2_CID_VFLIP)负责,坐标映射对所有
+层生效。面板侧 0xC7 SDIR 补 X 镜像,合成整机 180°。
+
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -184,8 +184,19 @@
+ 				     int layer, struct drm_plane *plane)
+ {
+ 	struct drm_plane_state *state = plane->state;
++	int crtc_y = state->crtc_y;
+ 
+ 	DRM_DEBUG_DRIVER("Updating layer %d\n", layer);
++
++	/*
++	 * 整机 Y 翻转:除了各层内容负 stride 倒扫(update_layer_buffer),
++	 * 层坐标也必须绕水平中线映射,否则非全屏层(overlay、部分刷新的
++	 * 脏矩形)内容翻了位置没翻,整屏错位。frontend 喂的视频层内容由
++	 * SDROT 预翻,坐标映射同样在这里生效。
++	 */
++	if (backend->yflip && state->crtc)
++		crtc_y = state->crtc->state->adjusted_mode.vdisplay -
++			 state->crtc_y - state->crtc_h;
+ 
+ 	if (plane->type == DRM_PLANE_TYPE_PRIMARY) {
+ 		DRM_DEBUG_DRIVER("Primary layer, updating global size W: %u H: %u\n",
+@@ -204,10 +215,10 @@
+ 
+ 	/* Set base coordinates */
+ 	DRM_DEBUG_DRIVER("Layer coordinates X: %d Y: %d\n",
+-			 state->crtc_x, state->crtc_y);
++			 state->crtc_x, crtc_y);
+ 	regmap_write(backend->engine.regs, SUN4I_BACKEND_LAYCOOR_REG(layer),
+ 		     SUN4I_BACKEND_LAYCOOR(state->crtc_x,
+-					   state->crtc_y));
++					   crtc_y));
+ 
+ 	return 0;
+ }
+@@ -376,13 +387,8 @@
+ 	struct drm_plane_state *state = plane->state;
+ 	struct drm_framebuffer *fb = state->fb;
+ 	u32 lo_paddr, hi_paddr;
++	u32 linewidth = fb->pitches[0] * 8;
+ 	dma_addr_t paddr;
+-
+-	/* Set the line width */
+-	DRM_DEBUG_DRIVER("Layer line width: %d bits\n", fb->pitches[0] * 8);
+-	regmap_write(backend->engine.regs,
+-		     SUN4I_BACKEND_LAYLINEWIDTH_REG(layer),
+-		     fb->pitches[0] * 8);
+ 
+ 	/* Get the start of the displayed memory */
+ 	paddr = drm_fb_cma_get_gem_addr(fb, state, 0);
+@@ -390,6 +396,25 @@
+ 
+ 	if (fb->format->is_yuv)
+ 		return sun4i_backend_update_yuv_buffer(backend, fb, paddr);
++
++	/*
++	 * 倒装面板 Y 翻转:地址指最后一行,行宽写补码负值。行地址累加器
++	 * 只在低 32 位回绕(实测,H4ADD 不吃进位),等效逐行倒序扫描。
++	 * packed-YUV 层与 frontend 输入不经过这里,不受影响。
++	 */
++	if (backend->yflip) {
++		/* src_h 由 core 恒填;state->src 矩形只有 atomic_check
++		 * 走 helper 的驱动才有值,sun4i 没有,恒为 0 */
++		u32 h = state->src_h >> 16;
++
++		paddr += (dma_addr_t)(h - 1) * fb->pitches[0];
++		linewidth = -linewidth;
++	}
++
++	DRM_DEBUG_DRIVER("Layer line width: %d bits\n", linewidth);
++	regmap_write(backend->engine.regs,
++		     SUN4I_BACKEND_LAYLINEWIDTH_REG(layer),
++		     linewidth);
+ 
+ 	/* Write the 32 lower bits of the address (in bits) */
+ 	lo_paddr = paddr << 3;
+@@ -1466,6 +1489,8 @@
+ 	spin_lock_init(&backend->frontend_lock);
+ 	live_scanout = of_property_read_bool(dev->of_node,
+ 					     "srgn,live-scanout");
++	backend->yflip = of_property_read_bool(dev->of_node,
++					       "srgn,scanout-yflip");
+ 
+ 	if (of_find_property(dev->of_node, "interconnects", NULL)) {
+ 		/*
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -193,6 +193,9 @@
+ 	spinlock_t		frontend_lock;
+ 	bool			frontend_teardown;
+ 
++	/* srgn,scanout-yflip:负 stride 上下翻转扫描(倒装面板) */
++	bool			yflip;
++
+ 	const struct sun4i_backend_quirks	*quirks;
+ };
+ 

@@ -1,20 +1,23 @@
 cedrus: suniv SDROT 硬件旋转 m2m 节点
 
 老 IP(VE 0x1663)的 MPEG 引擎带 SDROT 单元,可对 32x32 tiled NV12
-(ST12)整帧做 90/180/270 旋转。寄存器序列取自 Tina libvideoengine.so
-的 RotateHw1663:输入走 REC_LUMA/CHROMA(0x148/0x14c),输出走
-ROT_LUMA/CHROMA(0x1cc/0x1d0),尺寸 0x1b8,角度 0x1d4,
+(ST12)整帧做 90/180/270 旋转和 H/V 镜像。寄存器序列取自 Tina
+libvideoengine.so 的 RotateHw1663:输入走 REC_LUMA/CHROMA(0x148/0x14c),
+输出走 ROT_LUMA/CHROMA(0x1cc/0x1d0),尺寸 0x1b8,操作码 0x1d4,
 CTRL=ROTATE_SCALE_OUT_EN|ROTATE_IRQ_EN|ERROR_IRQ_EN|FINISH_IRQ_EN,
-TRIGGER=(0x05<<24)|HW_ROTATE。
+TRIGGER=(0x05<<24)|HW_ROTATE。0x1d4[2:0] 操作码为板上实测:0-3=角度,
+4=H mirror,5=V mirror;6/7(mirror+90)未验证不下发,高位(bit4)会挂死
+总线,勿碰。
 
 注册为第二个 m2m video 节点(cedrus-rotate),与解码节点共用同一个
 m2m_dev:硬件互斥由 m2m 框架排队保证,中断分发复用 dec_ops 表
 (新槽位 CEDRUS_CODEC_ROTATE),cedrus_irq 不需要改。引擎选择走
 cedrus_engine_enable 的 MPEG case,自动带 sel_bias。
 
-普通 QBUF/STREAMON 流程,无 Request API;角度用标准 V4L2_CID_ROTATE
-(0/90/180/270)。两端格式均只有 ST12;src 传编码尺寸(宏块对齐),
-90/270 时 dst 宽高对调。chroma 平面偏移按解码输出布局
+普通 QBUF/STREAMON 流程,无 Request API;标准控制项 V4L2_CID_ROTATE
+(0/90/180/270)+ HFLIP/VFLIP,三者归一化成单操作码(双镜像=180°,
+单镜像∘180°=另一单镜像;单镜像+90/270 组合返回 -EINVAL)。两端格式
+均只有 ST12;src 传编码尺寸(宏块对齐),90/270 时 dst 宽高对调。chroma 平面偏移按解码输出布局
 stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
 (dmabuf 导入导出,零拷贝)。
 
@@ -41,18 +44,22 @@ stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
  	CEDRUS_CODEC_LAST,
  };
  
-@@ -124,6 +126,10 @@
+@@ -124,6 +126,14 @@
  			dma_addr_t	intra_pred_buf_dma;
  			ssize_t		intra_pred_buf_size;
  		} h264;
 +		struct {
-+			/* 度数(0/90/180/270),s_ctrl 写入,device_run 读 */
-+			unsigned int	angle;
++			/* s_ctrl 写入,device_run 读 */
++			unsigned int	angle;	/* 0/90/180/270 */
++			bool		hflip;
++			bool		vflip;
++			/* 由 angle/hflip/vflip 归一化出的 SDROT_CTRL[2:0] */
++			unsigned int	op;
 +		} rotate;
  	} codec;
  };
  
-@@ -146,6 +152,7 @@
+@@ -146,6 +156,7 @@
  struct cedrus_dev {
  	struct v4l2_device	v4l2_dev;
  	struct video_device	vfd;
@@ -60,7 +67,7 @@ stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
  	struct media_device	mdev;
  	struct media_pad	pad[2];
  	struct platform_device	*pdev;
-@@ -172,6 +179,11 @@
+@@ -172,6 +183,11 @@
  
  extern struct cedrus_dec_ops cedrus_dec_ops_mpeg2;
  extern struct cedrus_dec_ops cedrus_dec_ops_h264;
@@ -137,7 +144,7 @@ stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
  #define VE_DEC_MPEG_STATUS_CHECK_MASK \
  	(VE_DEC_MPEG_STATUS_SUCCESS | VE_DEC_MPEG_STATUS_ERROR | \
  	 VE_DEC_MPEG_STATUS_VLD_DATA_REQ)
-@@ -242,11 +243,20 @@
+@@ -242,11 +243,26 @@
  #define VE_DEC_MPEG_IQMINPUT_WEIGHT(i, v) \
  	(SHIFT_AND_MASK_BITS(i, 13, 8) | SHIFT_AND_MASK_BITS(v, 7, 0))
  
@@ -152,26 +159,33 @@ stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
  #define VE_DEC_MPEG_ROT_CHROMA			(VE_ENGINE_DEC_MPEG + 0xd0)
  
 +#define VE_DEC_MPEG_SDROT_CTRL			(VE_ENGINE_DEC_MPEG + 0xd4)
-+/* [1:0] 角度,单位 90 度;blob 只用这两位,mirror 位存在与否未探明 */
-+#define VE_DEC_MPEG_SDROT_CTRL_ANGLE(deg)	(((deg) / 90) & 0x3)
++/*
++ * [2:0] 操作码(板上实测):0-3 = 角度/90°,4 = H mirror,5 = V mirror。
++ * 6/7 应为 mirror+90°(输出宽高对调),未验证,驱动不下发。
++ * 高位别碰:bit4 会让 SoC 总线挂死。
++ */
++#define VE_DEC_MPEG_SDROT_CTRL_OP_ANGLE(deg)	(((deg) / 90) & 0x3)
++#define VE_DEC_MPEG_SDROT_CTRL_OP_HMIRROR	4
++#define VE_DEC_MPEG_SDROT_CTRL_OP_VMIRROR	5
 +
  #define VE_H264_SPS			0x200
  #define VE_H264_SPS_MBS_ONLY			BIT(18)
  #define VE_H264_SPS_MB_ADAPTIVE_FRAME_FIELD	BIT(17)
 --- /dev/null
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_rotate.c
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,537 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Cedrus VPU driver — suniv (VE 0x1663) SDROT rotate node
 + *
 + * 老 IP 的 MPEG 引擎自带 Scale-Down/Rotate 单元,能对 32x32 tiled
-+ * NV12(ST12)整帧做 90/180/270 旋转。寄存器序列取自 Tina
-+ * libvideoengine.so 的 RotateHw1663。
++ * NV12(ST12)整帧做 90/180/270 旋转和 H/V 镜像。寄存器序列取自 Tina
++ * libvideoengine.so 的 RotateHw1663;镜像操作码为板上实测。
 + *
 + * 以第二个 m2m video 节点注册,与解码节点共用同一个 m2m_dev,
 + * 由 m2m 框架保证与解码任务在 VE 上串行。普通 QBUF/STREAMON 流程,
-+ * 不走 Request API;角度用标准控制项 V4L2_CID_ROTATE。
++ * 不走 Request API;用标准控制项 V4L2_CID_ROTATE/HFLIP/VFLIP,
++ * 三者归一化成单个硬件操作码(见 cedrus_rotate_update_op)。
 + */
 +
 +#include <media/v4l2-device.h>
@@ -279,8 +293,7 @@ stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
 +	cedrus_write(dev, VE_DEC_MPEG_ROT_CHROMA,
 +		     dst_luma + cedrus_rotate_chroma_offset(dst_fmt));
 +
-+	cedrus_write(dev, VE_DEC_MPEG_SDROT_CTRL,
-+		     VE_DEC_MPEG_SDROT_CTRL_ANGLE(ctx->codec.rotate.angle));
++	cedrus_write(dev, VE_DEC_MPEG_SDROT_CTRL, ctx->codec.rotate.op);
 +
 +	cedrus_write(dev, VE_DEC_MPEG_CTRL,
 +		     VE_DEC_MPEG_CTRL_ROTATE_SCALE_OUT_EN |
@@ -308,17 +321,64 @@ stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
 +
 +/* 控制项 */
 +
++/*
++ * angle/hflip/vflip 归一化成 SDROT_CTRL[2:0] 单操作码:
++ * 双镜像 = 180° 旋转;单镜像与 180° 复合等于另一种单镜像
++ * (180° = H∘V,与镜像可交换);单镜像与 90°/270° 复合对应
++ * op 6/7,硬件未验证,拒绝。
++ */
++static int cedrus_rotate_update_op(struct cedrus_ctx *ctx,
++				   unsigned int angle, bool hflip, bool vflip)
++{
++	if ((hflip != vflip) && (angle == 90 || angle == 270))
++		return -EINVAL;
++
++	ctx->codec.rotate.angle = angle;
++	ctx->codec.rotate.hflip = hflip;
++	ctx->codec.rotate.vflip = vflip;
++
++	if (hflip && vflip) {
++		angle = (angle + 180) % 360;
++		hflip = vflip = false;
++	}
++	if (hflip != vflip) {
++		if (angle == 180) {
++			hflip = !hflip;
++			vflip = !vflip;
++		}
++		ctx->codec.rotate.op = hflip ?
++			VE_DEC_MPEG_SDROT_CTRL_OP_HMIRROR :
++			VE_DEC_MPEG_SDROT_CTRL_OP_VMIRROR;
++	} else {
++		ctx->codec.rotate.op = VE_DEC_MPEG_SDROT_CTRL_OP_ANGLE(angle);
++	}
++
++	return 0;
++}
++
 +static int cedrus_rotate_s_ctrl(struct v4l2_ctrl *ctrl)
 +{
 +	struct cedrus_ctx *ctx =
 +		container_of(ctrl->handler, struct cedrus_ctx, hdl);
++	unsigned int angle = ctx->codec.rotate.angle;
++	bool hflip = ctx->codec.rotate.hflip;
++	bool vflip = ctx->codec.rotate.vflip;
 +
-+	if (ctrl->id != V4L2_CID_ROTATE)
++	switch (ctrl->id) {
++	case V4L2_CID_ROTATE:
++		angle = ctrl->val;
++		break;
++	case V4L2_CID_HFLIP:
++		hflip = ctrl->val;
++		break;
++	case V4L2_CID_VFLIP:
++		vflip = ctrl->val;
++		break;
++	default:
 +		return -EINVAL;
++	}
 +
-+	ctx->codec.rotate.angle = ctrl->val;
-+
-+	return 0;
++	return cedrus_rotate_update_op(ctx, angle, hflip, vflip);
 +}
 +
 +static const struct v4l2_ctrl_ops cedrus_rotate_ctrl_ops = {
@@ -565,9 +625,13 @@ stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
 +	ctx->dev = dev;
 +	ctx->current_codec = CEDRUS_CODEC_ROTATE;
 +
-+	v4l2_ctrl_handler_init(&ctx->hdl, 1);
++	v4l2_ctrl_handler_init(&ctx->hdl, 3);
 +	v4l2_ctrl_new_std(&ctx->hdl, &cedrus_rotate_ctrl_ops,
 +			  V4L2_CID_ROTATE, 0, 270, 90, 0);
++	v4l2_ctrl_new_std(&ctx->hdl, &cedrus_rotate_ctrl_ops,
++			  V4L2_CID_HFLIP, 0, 1, 1, 0);
++	v4l2_ctrl_new_std(&ctx->hdl, &cedrus_rotate_ctrl_ops,
++			  V4L2_CID_VFLIP, 0, 1, 1, 0);
 +	if (ctx->hdl.error) {
 +		ret = ctx->hdl.error;
 +		goto err_free;

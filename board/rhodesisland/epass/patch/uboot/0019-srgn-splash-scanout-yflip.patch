@@ -1,0 +1,67 @@
+srgn_splash: 按 srgn,scanout-yflip 负 stride 翻转扫描
+
+DEBE 行地址累加器只在低 32 位回绕(板上实测):fb 指最后一行、
+layer0_stride 写补码负值即逐行倒序扫描,与内核 sun4i_backend 的
+srgn,scanout-yflip 同一机制,从同一份合并 DTB 的 be0 节点读取,
+开机 logo 素材无需预翻。
+
+--- a/board/sunxi/srgn_splash.c
++++ b/board/sunxi/srgn_splash.c
+@@ -144,10 +144,11 @@
+ 	       &ccm->lcd0_ch0_clk_cfg);
+ }
+ 
+-static void srgn_debe_setup(u32 fb, int xres, int yres)
++static void srgn_debe_setup(u32 fb, int xres, int yres, bool yflip)
+ {
+ 	struct sunxi_de_be_reg * const de_be =
+ 		(struct sunxi_de_be_reg *)SUNXI_DE_BE0_BASE;
++	u32 stride = (u32)xres * 16;
+ 	int i;
+ 
+ 	/* engine bug, clear registers after reset (as sunxi_display.c) */
+@@ -160,8 +161,16 @@
+ 	       &de_be->disp_size);
+ 	writel(SUNXI_DE_BE_HEIGHT(yres) | SUNXI_DE_BE_WIDTH(xres),
+ 	       &de_be->layer0_size);
++	/*
++	 * 倒装面板(srgn,scanout-yflip):地址指最后一行,行宽写补码负值,
++	 * 行地址累加器 32 位回绕,与内核 sun4i_backend 同一机制。
++	 */
++	if (yflip) {
++		fb += (u32)(yres - 1) * xres * 2;
++		stride = -stride;
++	}
+ 	/* stride and address registers are in bits, 16bpp */
+-	writel((u32)xres * 16, &de_be->layer0_stride);
++	writel(stride, &de_be->layer0_stride);
+ 	writel(fb << 3, &de_be->layer0_addr_low32b);
+ 	writel(fb >> 29, &de_be->layer0_addr_high4b);
+ 	writel(SRGN_DE_BE_LAYER_ATTR1_FMT_RGB565, &de_be->layer0_attr1_ctrl);
+@@ -316,8 +325,8 @@
+ 		(struct sunxi_lcdc_reg *)SUNXI_LCD0_BASE;
+ 	struct srgn_timing t;
+ 	unsigned long dtbaddr, fbaddr;
+-	bool swap_b_r, has_de;
+-	int div;
++	bool swap_b_r, has_de, yflip = false;
++	int div, be;
+ 
+ 	dtbaddr = argc > 1 ? simple_strtoul(argv[1], NULL, 16) :
+ 			     env_get_hex("dtbaddr", 0);
+@@ -346,8 +355,14 @@
+ 			   ALIGN(fbaddr + t.dt.hactive.typ * t.dt.vactive.typ * 2,
+ 				 64));
+ 
++	be = fdt_node_offset_by_compatible((void *)dtbaddr, -1,
++			"allwinner,suniv-f1c100s-display-backend");
++	if (be >= 0 &&
++	    fdt_getprop((void *)dtbaddr, be, "srgn,scanout-yflip", NULL))
++		yflip = true;
++
+ 	srgn_de_clocks_on();
+-	srgn_debe_setup(fbaddr, t.dt.hactive.typ, t.dt.vactive.typ);
++	srgn_debe_setup(fbaddr, t.dt.hactive.typ, t.dt.vactive.typ, yflip);
+ 	srgn_lcd_pinmux(has_de);
+ 
+ 	lcdc_init(lcdc);

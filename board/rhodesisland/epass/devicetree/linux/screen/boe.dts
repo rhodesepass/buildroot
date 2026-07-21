@@ -26,6 +26,9 @@
                 ST7701INIT_WRITE_C8_D16 0xC1 0x10 0x0C
                 ST7701INIT_WRITE_C8_D16 0xC2 0x07 0x0A
 
+                /* x flip */
+                ST7701INIT_WRITE_C8_D8 0xC7 0x04
+
                 ST7701INIT_WRITE_COMMAND_8 0xC3
                 ST7701INIT_WRITE_BYTES 3 0x82 0x18 0x0e
 
@@ -173,6 +176,13 @@
         target = <&panel>;
         __overlay__ {
             compatible = "lattland,mostima", "simple-panel";
+        };
+    };
+
+    fragment@3 {
+        target = <&be0>;
+        __overlay__ {
+            srgn,scanout-yflip;
         };
     };
 };

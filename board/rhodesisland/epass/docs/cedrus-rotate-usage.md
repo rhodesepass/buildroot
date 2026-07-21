@@ -3,8 +3,8 @@
 对应补丁:`0028-cedrus-suniv-sdrot-rotate-m2m-node.patch`
 
 内核里多出一个 V4L2 m2m 设备节点(名字 `cedrus-rotate`),用 VE 的 SDROT
-单元对整帧做 90/180/270 硬件旋转。输入输出都是 32x32 tiled NV12
-(fourcc `ST12`),也就是 cedrus 解码节点吐出来的原生格式。
+单元对整帧做 90/180/270 硬件旋转和水平/垂直镜像。输入输出都是 32x32
+tiled NV12(fourcc `ST12`),也就是 cedrus 解码节点吐出来的原生格式。
 
 一次任务 = 喂一个输入 buffer + 一个输出 buffer,硬件转完各还你一个。
 和解码共用 VE,内核自动排队,应用层不用管互斥。
@@ -17,6 +17,7 @@ v4l2-ctl --list-devices
 
 # 看控制项在不在
 v4l2-ctl -d /dev/video1 -L        # 应有 rotate (int): min=0 max=270 step=90
+                                  # 以及 horizontal_flip / vertical_flip (bool)
 
 # 拿一帧解码输出(ST12 裸数据)转 90 度:
 v4l2-ctl -d /dev/video1 \
@@ -92,6 +93,29 @@ sizeimage = 两者之和
 struct v4l2_control ctrl = { .id = V4L2_CID_ROTATE, .value = 90 };
 ioctl(fd, VIDIOC_S_CTRL, &ctrl);
 ```
+
+### 镜像(HFLIP / VFLIP)
+
+标准布尔控制项,用法同角度:
+
+```c
+struct v4l2_control ctrl = { .id = V4L2_CID_VFLIP, .value = 1 };
+ioctl(fd, VIDIOC_S_CTRL, &ctrl);
+```
+
+倒装机型(如 boe)的视频链就靠 VFLIP 补 Y 分量——DEBE 只翻层坐标不翻
+frontend 灌的内容,见 `boe-flip-180.md`。
+
+硬件层面三个控制项归一化成一个操作码(`SDROT_CTRL[2:0]`:0-3 =
+0/90/180/270,4 = H 镜像,5 = V 镜像,均板上实测),驱动自动化简:
+
+| 你设的组合 | 实际执行 |
+|---|---|
+| hflip + vflip | 等效 180°,折进角度 |
+| 单镜像 + rotate=180 | 换成另一个方向的单镜像 |
+| 单镜像 + rotate=90/270 | **S_CTRL 返回 -EINVAL**(对应 op 6/7 硬件未验证,不放行;真需要时先上板验证 op6/7 再放开) |
+
+镜像不改变宽高,CAPTURE 端尺寸规则只看角度。
 
 ## 3. 完整流程(MMAP 版,单帧)
 
@@ -201,7 +225,10 @@ DQBUF → 该帧用完后解码节点再 QBUF(i) 还回去。注意解码 buffer
 1. **输出仍是 tiled**。这个节点只解决旋转,不做 untile;显示前该怎么
    转线性还怎么转(转换时用旋转后的宽高和新 stride)。
 2. **角度顺逆未验证**。硬件文档缺失,90 是顺时针还是逆时针,拿一帧带
-   方向的图试一次;反了就用 270。
+   方向的图试一次;反了就用 270。现成工具:`boe_flip/debe_flip/
+   st12rot_probe`(生成 128x96 四角唯一灰度块的 ST12 帧过一遍 m2m,
+   自动判定实际变换,用法 `st12rot_probe [angle] [hflip] [vflip]
+   [dumpfile]`),HFLIP/VFLIP 的五项组合就是拿它验的。
 3. **和解码抢 VE**。任务串行,一帧旋转大约给解码链路加不到 1ms 级的
    占用(相对你 293ms 的解码耗时可忽略),但别在解码卡住排查性能时
    忘了它的存在。
@@ -212,3 +239,6 @@ DQBUF → 该帧用完后解码节点再 QBUF(i) 还回去。注意解码 buffer
    补 VE 复位。
 5. **每个 open 是独立会话**(独立格式/角度/队列),多个进程可各开各的,
    内核排队;但同一会话内一次只有一对 buffer 在硬件里。
+6. **给以后改驱动的人**:`SDROT_CTRL` 只有 [2:0] 是安全的。探测时
+   实测置 bit4(0x10)会让 SoC 总线硬挂死(串口无响应,只能断电),
+   别碰 [2:0] 以外的位。
