@@ -35,25 +35,10 @@ pick_app() {
     esac
 }
 
-# NAND 启动时外置 SD 卡是 mmcblk0p1;
-# SD 启动时系统本身在 SD 上, /sd 对应第三个 share 分区(S000sdsetup 负责格式化)
-sd_dev() {
-    if grep -q 'root=/dev/mmcblk0p2' /proc/cmdline; then
-        echo /dev/mmcblk0p3
-    else
-        echo /dev/mmcblk0p1
-    fi
-}
-
-# 只负责挂载；app 自己按 /proc/mounts 判断 /sd 是否可用，不再传参
+# 挂载逻辑收进 /usr/sbin/sdmount(与 mdev 热插拔共用, flock 串行化);
+# app 自己按 /proc/mounts 判断 /sd 是否可用，不再传参
 remount_sd() {
-    SD_DEV=$(sd_dev)
-    umount /sd > /dev/null 2>&1
-    umount "$SD_DEV" > /dev/null 2>&1
-    mkdir -p /sd
-    if mount -o iocharset=utf8 "$SD_DEV" /sd > /dev/null 2>&1; then
-        mkdir -p /sd/app /sd/assets
-    fi
+    /usr/sbin/sdmount remount > /dev/null 2>&1
 }
 
 supervise() {

@@ -1,0 +1,48 @@
+#!/bin/sh
+#
+# mdev 热插拔钩子(见 /etc/mdev.conf 的 mmcblk 规则)
+# mdev daemon 用 system() 同步执行本脚本,会阻塞后续 uevent,必须秒级返回
+
+# SD 启动时拔卡 = rootfs 死, 由 /tmp 里的 sdwatch 兜底, 这里不管
+grep -q 'root=/dev/mmcblk0p2' /proc/cmdline && exit 0
+
+log() {
+    echo "sd-hotplug: $*" > /dev/kmsg
+}
+
+# app 未运行时 unix socket 连接立刻失败, 只记日志
+notify() {
+    epassctl prts reload_assets 2> /dev/null || log "app reload failed"
+    epassctl app reload_list 2> /dev/null || log "app reload failed"
+}
+
+warn() {
+    epassctl ui warning "无法识别的存储卡" "请重新格式化 SD 卡" \
+        sd_card 0xFFFF4040 2> /dev/null || log "warn popup failed"
+}
+
+case "$ACTION:$MDEV" in
+    add:mmcblk0)
+        # 整盘 add uevent 发出前分区已注册; 无 p1 目录 = 无分区表的整盘卡
+        [ -d /sys/block/mmcblk0/mmcblk0p1 ] || warn
+        ;;
+    add:mmcblk0p1)
+        # S10mdev initial_scan coldplug 时 S01app(S01<S10) 已挂好, 跳过
+        grep -q '^/dev/mmcblk0p1 /sd ' /proc/mounts && exit 0
+        if /usr/sbin/sdmount remount; then
+            notify
+        else
+            log "mount p1 failed"
+            # 拔卡瞬间 mount 失败节点已消失, 只在节点还在时才弹窗
+            [ -b /dev/mmcblk0p1 ] && warn
+        fi
+        ;;
+    remove:mmcblk0p1)
+        /usr/sbin/sdmount umount
+        notify
+        ;;
+    *)
+        # * 前缀规则连 change/bind/unbind 都会触发, 白名单忽略
+        ;;
+esac
+exit 0

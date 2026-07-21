@@ -1,0 +1,48 @@
+#!/bin/sh
+#
+# /sd 挂载唯一入口: S01app 与 mdev 热插拔都走这里, flock 串行化
+# 用法: sdmount mount|umount|remount
+
+LOCK=/var/run/sdmount.lock
+[ "$SDMOUNT_LOCKED" ] || { SDMOUNT_LOCKED=1 exec flock "$LOCK" "$0" "$@"; }
+
+# NAND 启动时外置 SD 卡是 mmcblk0p1;
+# SD 启动时系统本身在 SD 上, /sd 对应第三个 share 分区
+sd_dev() {
+    if grep -q 'root=/dev/mmcblk0p2' /proc/cmdline; then
+        echo /dev/mmcblk0p3
+    else
+        echo /dev/mmcblk0p1
+    fi
+}
+
+# 拔卡后的死挂载可能叠了多层, 循环 lazy umount, 上限防死循环
+do_umount() {
+    n=0
+    while grep -q ' /sd ' /proc/mounts && [ $n -lt 10 ]; do
+        umount -l /sd 2> /dev/null || break
+        n=$((n + 1))
+    done
+    umount -l "$(sd_dev)" 2> /dev/null
+    return 0
+}
+
+do_mount() {
+    DEV=$(sd_dev)
+    mkdir -p /sd
+    [ -b "$DEV" ] || return 1
+    mount -o iocharset=utf8 "$DEV" /sd && mkdir -p /sd/app /sd/assets
+}
+
+case "$1" in
+    mount) do_mount ;;
+    umount) do_umount ;;
+    remount)
+        do_umount
+        do_mount
+        ;;
+    *)
+        echo "Usage: $0 {mount|umount|remount}"
+        exit 1
+        ;;
+esac

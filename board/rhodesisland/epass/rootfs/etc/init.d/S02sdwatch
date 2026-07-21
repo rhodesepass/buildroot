@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# SD 启动: 把拔卡 watcher 全套部署进 tmpfs 并启动
+# (拔卡 = rootfs 死, watcher 及其依赖必须提前离开 rootfs, 详见 sdwatch 头注)
+
+case "$1" in
+    start | restart) ;;
+    stop)
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+grep -q 'root=/dev/mmcblk0p2' /proc/cmdline || exit 0
+
+cp /bin/busybox /tmp/busybox
+cp /usr/sbin/sdwatch /tmp/sdwatch
+cp /usr/bin/sderror /tmp/sderror
+chmod +x /tmp/busybox /tmp/sderror
+
+/tmp/busybox sh /tmp/sdwatch < /dev/null > /dev/null 2>&1 &
