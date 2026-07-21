@@ -1,7 +1,9 @@
 #!/bin/sh
 #
-# SD 启动: 把拔卡 watcher 全套部署进 tmpfs 并启动
-# (拔卡 = rootfs 死, watcher 及其依赖必须提前离开 rootfs, 详见 sdwatch 头注)
+# SD 启动: 部署拔卡守护到 tmpfs 并启动。
+# sdwatch 是静态二进制(watch/杀进程/SD ERROR 显示合一), 平时只轮询
+# 不申请显存; 从 /tmp 运行使代码页落在 tmpfs, 拔卡(rootfs 死)后
+# 不再依赖 SD 上的任何文件
 
 case "$1" in
     start | restart) ;;
@@ -16,9 +18,7 @@ esac
 
 grep -q 'root=/dev/mmcblk0p2' /proc/cmdline || exit 0
 
-cp /bin/busybox /tmp/busybox
+killall sdwatch 2> /dev/null    # restart 防叠一个守护
 cp /usr/sbin/sdwatch /tmp/sdwatch
-cp /usr/bin/sderror /tmp/sderror
-chmod +x /tmp/busybox /tmp/sderror
-
-/tmp/busybox sh /tmp/sdwatch < /dev/null > /dev/null 2>&1 &
+chmod +x /tmp/sdwatch
+/tmp/sdwatch < /dev/null > /dev/null 2>&1 &
