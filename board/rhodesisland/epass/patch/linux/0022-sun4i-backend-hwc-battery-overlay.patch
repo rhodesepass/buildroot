@@ -25,7 +25,7 @@ userspace daemon; the driver itself does not read the GPADC.
 
 --- a/drivers/gpu/drm/sun4i/sun4i_backend.c
 +++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
-@@ -897,6 +897,418 @@
+@@ -897,6 +897,444 @@
  	mutex_unlock(&srgn_splash_lock);
  }
  
@@ -261,6 +261,18 @@ userspace daemon; the driver itself does not read the GPADC.
 +	regmap_write(regs, BAT_HWC_PALETTE_OFF + 4, bat_hwc.color);
 +
 +	bat_hwc_render(pat);
++	if (backend->yflip) {
++		/* 上下翻转 pattern:每行 2 个 word,行 r 与 63-r 对调 */
++		for (r = 0; r < BAT_HWC_H / 2; r++) {
++			u32 t0 = pat[r * 2], t1 = pat[r * 2 + 1];
++			int m = (BAT_HWC_H - 1 - r) * 2;
++
++			pat[r * 2]     = pat[m];
++			pat[r * 2 + 1] = pat[m + 1];
++			pat[m]     = t0;
++			pat[m + 1] = t1;
++		}
++	}
 +	for (i = 0; i < BAT_HWC_WORDS; i++)
 +		regmap_write(regs, BAT_HWC_PATTERN_OFF + i * 4, pat[i]);
 +
@@ -458,7 +470,7 @@ userspace daemon; the driver itself does not read the GPADC.
  static int sun4i_backend_bind(struct device *dev, struct device *master,
  			      void *data)
  {
-@@ -1058,6 +1470,8 @@
+@@ -1058,6 +1496,8 @@
  		srgn_splash_handover_init(dev, backend);
  	}
  
@@ -467,7 +479,7 @@ userspace daemon; the driver itself does not read the GPADC.
  	backend->quirks = quirks;
  
  	return 0;
-@@ -1078,6 +1492,8 @@
+@@ -1078,6 +1518,8 @@
  {
  	struct sun4i_backend *backend = dev_get_drvdata(dev);
  

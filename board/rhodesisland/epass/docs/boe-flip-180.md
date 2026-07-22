@@ -25,8 +25,13 @@ BOE 机型的屏(mostima 360x640,ST7701S)在整机里是倒着装的,画面需�
 |---|---|---|
 | Y(上下) | DEBE(UI/C8 层) | 负 stride 倒扫 + 层坐标映射 |
 | Y(视频层内容) | VE SDROT | V4L2_CID_VFLIP,见 cedrus-rotate-usage.md |
+| Y(HWC 电池层) | DEBE HWC(patch 0022) | 位置映射到底部 + pattern 行倒序 |
 | X(左右) | 面板 ST7701S | init 序列 BK0 `0xC7 0x04`(SDIR,源极反扫) |
 | splash | U-Boot | 与内核同机制,读同一个 DT key |
+
+HWC 电池层要单列一行:它是 alpha blender0 上的独立硬件块,layer 的负
+stride 倒扫和层坐标映射都作用不到它,面板 SDIR 又只翻 X,所以整机
+180° 的 Y 分量得在 `bat_hwc_apply()` 里自己补(读同一个 `backend->yflip`)。
 
 X 镜像敢交给面板是因为 SDIR 只反转源极输出顺序,不碰 GIP;实测无副作用。
 Y 交给 SoC 是因为 GIP 不对称(上面第 1 条)。
@@ -131,3 +136,4 @@ stride 取负。`do_srgn_splash` 用
 - app UI 整机 180° 正立、内容清晰 ✓(内核 yflip + 面板 SDIR)
 - 层坐标映射 ✓(overlay 位置正确)
 - 视频层 VFLIP:内核/驱动侧就绪,app 集成待做
+- HWC 电池层 Y 翻转(patch 0022):代码就绪,**未上板验证**
