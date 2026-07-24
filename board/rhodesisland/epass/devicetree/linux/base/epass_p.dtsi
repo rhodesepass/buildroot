@@ -51,6 +51,8 @@
 
 &battery_power_supply {
 	status = "okay";
+
+	x-powers,no-thermistor;
 };
 
 &ac_power_supply {

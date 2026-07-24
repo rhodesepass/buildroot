@@ -1,0 +1,47 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] power: supply: axp20x_battery - allow disabling the TS pin
+
+Boards that leave the AXP209 TS pin unconnected still get the 80uA
+source driving it, so the TS ADC rails (0xfff) and the PMIC compares
+that against V_LTF-charge (REG38, 2.112V by default). The result is a
+permanent under-temperature fault: REG33 still reads charging-enabled,
+the AC rail is up, yet the charge current stays at 0mA and the battery
+reports "Not charging" forever.
+
+Add an optional "x-powers,no-thermistor" property on the battery node
+that switches the TS pin over to the generic external-ADC function
+(REG84 bit 2), which takes the charge temperature comparators out of
+the charging path. Boards with a real NTC fitted are unaffected.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+---
+--- a/drivers/power/supply/axp20x_battery.c
++++ b/drivers/power/supply/axp20x_battery.c
+@@ -37,6 +37,8 @@
+ #define AXP20X_PWR_OP_BATT_PRESENT	BIT(5)
+ #define AXP20X_PWR_OP_BATT_ACTIVATED	BIT(3)
+ 
++#define AXP20X_ADC_RATE_TS_EXT_ADC	BIT(2)
++
+ #define AXP209_FG_PERCENT		GENMASK(6, 0)
+ #define AXP22X_FG_VALID			BIT(7)
+ 
+@@ -586,6 +588,18 @@
+ 	}
+ 
+ 	axp20x_batt->regmap = dev_get_regmap(pdev->dev.parent, NULL);
++
++	/*
++	 * Without an NTC fitted the TS pin floats to the rail, the PMIC reads
++	 * that as an under-temperature fault and silently refuses to charge.
++	 * Handing the pin to the plain ADC function takes the charge
++	 * temperature comparators out of the loop.
++	 */
++	if (of_property_read_bool(dev->of_node, "x-powers,no-thermistor"))
++		regmap_update_bits(axp20x_batt->regmap, AXP20X_ADC_RATE,
++				   AXP20X_ADC_RATE_TS_EXT_ADC,
++				   AXP20X_ADC_RATE_TS_EXT_ADC);
++
+ 	platform_set_drvdata(pdev, axp20x_batt);
+ 
+ 	psy_cfg.drv_data = axp20x_batt;

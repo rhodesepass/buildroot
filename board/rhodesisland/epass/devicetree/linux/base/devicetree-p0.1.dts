@@ -43,7 +43,17 @@
 	rst-gpios = <&pio 4 11 GPIO_ACTIVE_HIGH>; /* PE11 */
 };
 
+&pio {
+	pmic_irq_pin: pmic-irq-pin {
+		pins = "PE2";
+		function = "irq";
+		bias-pull-up;
+	};
+};
+
 &axp209 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pmic_irq_pin>;
 	interrupt-parent = <&pio>;
 	interrupts = <4 2 IRQ_TYPE_LEVEL_LOW>; /* PE2 */
 };
