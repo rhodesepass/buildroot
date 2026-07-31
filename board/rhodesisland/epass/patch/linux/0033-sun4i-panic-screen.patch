@@ -1,0 +1,998 @@
+sun4i-backend: panic 时把内核日志画到屏上
+
+5.4 没有 drm_panic,本板又不编 CONFIG_FB/CONFIG_VT,内核一死屏幕就
+定格在 app 最后一帧,panic=5 静默重启,现场什么都不留。
+
+上游 drm_panic 的做法是让驱动记住"当前正在扫描的那块 buffer"。这个
+记账本身是错的:app 双缓冲、换层、重启,任何软件侧的镜像都可能比硬件
+慢一拍——记的是前一帧那块,画上去看不见。所以不记,直接问 DEBE。panic
+时层寄存器就是唯一真相:哪些层开着、多大、各自从哪个物理地址取数。
+
+这颗 SoC 没有 IOMMU,那个物理地址一定是连续的 lowmem,phys_to_virt()
+直接落在上面。挑面积最大、每像素不小于 2 字节的使能层,往它的页里画
+RGB565,然后把该层格式强改成 RGB565、其余层和 HWC 全关掉。格式只会
+往小改,ARGB8888 的 buffer 装 RGB565 绰绰有余,越不出界。
+
+于是 panic 路径上没有任何软件状态依赖:不追踪、不持 GEM 引用、不在
+atomic commit 里挂钩子、不分配内存,几何和格式全部现场从寄存器读,
+没有一处写死的分辨率。
+
+层寄存器里放的是 DMA 总线地址不是 CPU 物理地址:DT 没有 interconnects,
+bind 走 dma_pfn_offset 那条路,DEBE 眼里 DRAM 从 0 开始(板上实测
+lay1 pa=0x01c50000,真实物理是 0x81c50000)。唯一的例外是 U-Boot 留下
+的 splash 层——U-Boot 不知道有这回事,写的是裸 CPU 地址,所以 LAYFB_H4ADD
+里只有它那个 nibble 非零。先按 dma_pfn_offset 翻译,不落在 lowmem 就按
+原值再试一次,取能落到真实内存的那个。
+
+抢层之后把 LAYCOOR 归零、LAYSIZE 收到 DISSIZE 以内:app 可以把 overlay
+停在任意位置(板上实测 RGB565 那层坐标 y=900),字滚出屏幕跟没画一样。
+
+panic 上下文约束:
+  - 不进 regmap。默认 regmap_config 没有 fast_io 用的是 mutex,而
+    regmap-mmio 的 write 还会 clk_enable(),两者都可能睡眠。全程用
+    bind 时保存的裸 __iomem + readl_relaxed/writel_relaxed。
+  - 用 kmsg_dump 而不是 panic_notifier:一条路径同时覆盖 oops 和
+    panic,而且 CONFIG_ARM_UNWIND=y 时 die() 已经把寄存器/PC/LR/回溯
+    printk 进 ring buffer 了,画出日志尾部就等于画出了全部现场。
+  - 自己 kmsg_dump_rewind_nolock():kmsg_dump() 给的迭代器从 clear_seq
+    开始,跑过 dmesg -c 就什么都看不见了。
+  - 文本先进固定 BSS 环形缓冲再一次性 blit,不分配、不睡眠。
+
+字体用 6x10 而不是常见的 8x16:360x640 那块屏上是 60x64 格对 45x40 格
+的差别,panic 屏只有把回溯装得下才有意义。lib/fonts 里宽度不超过 8 的
+字模一律一字节一行、最左像素在 bit7,所以 blit 不关心选的是哪一个。
+FONT_6x10 原本 depends on FONTS(而 FONTS 又 depends on FRAMEBUFFER_CONSOLE),
+照 FONT_8x16 的写法改成 `bool "..." if FONTS` + `depends on !SPARC`,
+就能被 DRM_SUN4I_PANIC 直接 select,不产生 unmet dependency 警告。
+
+倒装面板(srgn,scanout-yflip)不需要特殊处理:LAYLINEWIDTH 为负说明
+是倒序扫描、地址寄存器指向最后一行,保持这个符号即可;面板 0xC7 SDIR
+补的 X 镜像凑成整屏 180°,用正常坐标画出来就是正的。
+
+先画像素、刷 cache,再改寄存器并锁存 REGBUFFCTL,中间不会有哪一帧显示
+画到一半的屏。__cpuc_flush_dcache_area() 是无条件做的:落到 U-Boot
+splash 保留区时那是普通可缓存 lowmem,落到 CMA buffer 时早已被
+dma_alloc_wc 改成非缓存,而我们分辨不出是哪一种——对后者 clean 是空操作。
+ARM926 是 VIVT,绝不为前者另建非缓存别名,那样别名语义是坏的。
+
+C8 层(调色板模式)是唯一的例外:一字节每像素没有余量改成 RGB565,只能
+按原样用,并且从 DEBE 调色板 SRAM 读回 256 项挑最暗/最亮两个索引——不改
+表,改表会破坏还留在屏上的其它内容。它的 stride 也保持硬件原值。
+
+画完顺手关掉看门狗:没人喂狗了,而这颗 SoC 的 WDT 没有 pretimeout 中断,
+超时直接复位整片,会把刚画好的屏冲掉。
+
+/sys/kernel/srgn_panic/test 是 bring-up 触发器(1=panic 2=BUG
+3=NULL deref 4=WARN,WARN 那档应当不上屏)。本 defconfig 关了
+MAGIC_SYSRQ,独立测试模块又要单开一个 buildroot 包,不值当。
+
+已知边界:一个层都没开(app 主动 blank),或者时钟被 clk_disable_unused /
+crtc disable 关掉、面板已经进 sleep 需要 SPI 唤醒——panic 里进不了 CCF
+也发不了 SPI,这些情况只能放弃,串口留一行 pr_emerg。
+
+--- a/lib/fonts/Kconfig
++++ b/lib/fonts/Kconfig
+@@ -81,8 +81,8 @@
+ 	depends on !SPARC && FONTS
+ 
+ config FONT_6x10
+-	bool "Medium-size 6x10 font"
+-	depends on !SPARC && FONTS
++	bool "Medium-size 6x10 font" if FONTS
++	depends on !SPARC
+ 	help
+ 	  Medium-size console font. Suitable for framebuffer consoles on
+ 	  embedded devices with a 320x240 screen, to get a reasonable number
+--- a/drivers/gpu/drm/sun4i/Kconfig
++++ b/drivers/gpu/drm/sun4i/Kconfig
+@@ -41,6 +41,18 @@
+ 	  do some alpha blending and feed graphics to TCON. If M is
+ 	  selected the module will be called sun4i-backend.
+ 
++config DRM_SUN4I_PANIC
++	bool "Draw the kernel log on the panel when the kernel dies"
++	depends on DRM_SUN4I_BACKEND && PRINTK
++	default DRM_SUN4I_BACKEND
++	select FONT_SUPPORT
++	select FONT_6x10
++	help
++	  On a panic or an oops, paint the tail of the kernel log into the
++	  buffer the display backend is already scanning out.  Useful on
++	  appliances built without CONFIG_FB and CONFIG_VT, where a dying
++	  kernel otherwise just freezes the panel on the last frame.
++
+ config DRM_SUN6I_DSI
+ 	tristate "Allwinner A31 MIPI-DSI Controller Support"
+ 	default MACH_SUN8I
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ sun4i-backend-y			+= sun4i_backend.o sun4i_layer.o
++sun4i-backend-$(CONFIG_DRM_SUN4I_PANIC)	+= sun4i_panic.o
+ sun4i-frontend-y		+= sun4i_frontend.o
+ 
+ sun4i-drm-y			+= sun4i_drv.o
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -27,6 +27,7 @@
+ #include "sun4i_drv.h"
+ #include "sun4i_frontend.h"
+ #include "sun4i_layer.h"
++#include "sun4i_panic.h"
+ #include "sunxi_engine.h"
+ 
+ #include <linux/delay.h>
+@@ -1610,6 +1611,9 @@
+ 
+ 	list_add_tail(&backend->engine.list, &drv->engine_list);
+ 
++	/* Raw MMIO base for the panic screen: regmap is not panic-safe */
++	srgn_panic_init(dev, drm->dev, backend, regs);
++
+ 	quirks = of_device_get_match_data(dev);
+ 	if (!live_scanout) {
+ 		/*
+@@ -1683,6 +1687,7 @@
+ {
+ 	struct sun4i_backend *backend = dev_get_drvdata(dev);
+ 
++	srgn_panic_fini(backend);
+ 	debe_palette_fini(backend);
+ 	battery_hwc_fini(backend);
+ 
+--- a/drivers/gpu/drm/sun4i/sun4i_panic.h
++++ b/drivers/gpu/drm/sun4i/sun4i_panic.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2026 Rhodes Island
++ *
++ * Panic screen for the sun4i display backend.
++ */
++
++#ifndef _SUN4I_PANIC_H_
++#define _SUN4I_PANIC_H_
++
++#include <linux/types.h>
++
++struct device;
++struct sun4i_backend;
++
++#ifdef CONFIG_DRM_SUN4I_PANIC
++
++void srgn_panic_init(struct device *dev, struct device *dma_dev,
++		     struct sun4i_backend *backend, void __iomem *regs);
++void srgn_panic_fini(struct sun4i_backend *backend);
++
++#else
++
++static inline void srgn_panic_init(struct device *dev,
++				   struct device *dma_dev,
++				   struct sun4i_backend *backend,
++				   void __iomem *regs) {}
++static inline void srgn_panic_fini(struct sun4i_backend *backend) {}
++
++#endif /* CONFIG_DRM_SUN4I_PANIC */
++
++#endif /* _SUN4I_PANIC_H_ */
+--- a/drivers/gpu/drm/sun4i/sun4i_panic.c
++++ b/drivers/gpu/drm/sun4i/sun4i_panic.c
+@@ -0,0 +1,817 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright (C) 2026 Rhodes Island
++ *
++ * Panic screen for the sun4i display backend.
++ *
++ * 5.4 has no drm_panic, and this board builds without CONFIG_FB / CONFIG_VT,
++ * so a dying kernel leaves the panel frozen on whatever the app drew last.
++ *
++ * Upstream drm_panic asks the driver to remember which buffer is being
++ * scanned out.  That bookkeeping is a lie waiting to happen: the app double
++ * buffers, swaps layers, restarts, and any software mirror of "what is on
++ * screen right now" can be one flip stale.  So don't mirror -- ask DEBE.
++ * At panic time the layer registers *are* the truth: which layers are on,
++ * how big they are, and the physical address each one is fetching from.
++ *
++ * There is no IOMMU on this SoC, so that physical address is a contiguous
++ * lowmem span and phys_to_virt() lands straight on it.  Pick the biggest
++ * enabled layer with at least 2 bytes per pixel, paint RGB565 into its
++ * pages, then force the layer's format to RGB565 and switch every other
++ * layer off.  Downgrading the format can only ever shrink the footprint, so
++ * an ARGB8888 buffer has room to spare and nothing can run off the end.
++ */
++
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/font.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/kmsg_dump.h>
++#include <linux/kobject.h>
++#include <linux/mm.h>
++#include <linux/of_address.h>
++#include <linux/sysfs.h>
++#include <linux/utsname.h>
++
++#include <asm/cacheflush.h>
++
++#include "sun4i_backend.h"
++#include "sun4i_panic.h"
++
++/*
++ * Text is staged in a fixed BSS ring before it is blitted: nothing may be
++ * allocated once we are in the dumper.  128x128 covers any panel this SoC can
++ * drive at 6x10 and costs 16 KiB of BSS.
++ */
++#define PANIC_MAX_COLS		128
++#define PANIC_MAX_ROWS		128
++
++/* Below this the penguin does not leave enough room for readable text. */
++#define PANIC_LOGO_MIN_COLS	32
++#define PANIC_LOGO_W		12
++#define PANIC_LOGO_X		1
++
++/* sun6i-style watchdog, WDT_MODE offset (see drivers/watchdog/sunxi_wdt.c) */
++#define PANIC_WDT_MODE		0x18
++
++struct srgn_panic_ctx {
++	void __iomem		*regs;		/* DEBE, raw MMIO only */
++	void __iomem		*wdt;
++	unsigned long		dma_pfn_off;
++	struct kobject		*kobj;
++	struct sun4i_backend	*backend;
++	int			in_dump;
++};
++
++/* The canvas we found in the layer registers, valid only inside a dump. */
++struct srgn_panic_canvas {
++	void			*va;		/* first row DEBE fetches */
++	s32			pitch;		/* signed: negative scans up */
++	u32			width;
++	u32			height;
++	unsigned int		bpp;		/* 2 = forced RGB565, 1 = C8 */
++	int			layer;
++};
++
++static struct srgn_panic_ctx srgn_panic;
++static struct srgn_panic_canvas srgn_panic_cv;
++
++/*
++ * 6x10 rather than the usual 8x16: on the 360x640 panel that is the
++ * difference between 45x40 and 60x64 cells, and a panic screen is only worth
++ * anything if the backtrace actually fits on it.  Every lib/fonts glyph up to
++ * 8 pixels wide is one byte per row with the leftmost pixel in bit 7, so the
++ * blit below does not care which one is picked.
++ */
++static const u8 *srgn_panic_glyphs;
++static u32 srgn_panic_fw, srgn_panic_fh;
++
++/* Tux, verbatim from upstream drm_panic.c */
++static const char *const srgn_panic_logo[] = {
++	"     .--.",
++	"    |o_o |",
++	"    |:_/ |",
++	"   //   \\ \\",
++	"  (|     | )",
++	" /'\\_   _/`\\",
++	" \\___)=(___/",
++};
++
++static char srgn_panic_text[PANIC_MAX_ROWS][PANIC_MAX_COLS];
++static unsigned int srgn_panic_nlines;
++
++/*
++ * regmap is off limits here: the backend's config has no fast_io so it locks
++ * with a mutex, and regmap-mmio's write path clk_enable()s on the way in.
++ * Both can sleep.  Raw MMIO on the base we stashed at bind time.
++ */
++static inline u32 be_r(u32 off)
++{
++	return readl_relaxed(srgn_panic.regs + off);
++}
++
++static inline void be_w(u32 off, u32 val)
++{
++	writel_relaxed(val, srgn_panic.regs + off);
++}
++
++/* ------------------------------------------------------------------ */
++/* finding the canvas                                                  */
++/* ------------------------------------------------------------------ */
++
++static unsigned int srgn_panic_fbfmt_bpp(u32 attr1)
++{
++	switch (attr1 & SUN4I_BACKEND_ATTCTL_REG1_LAY_FBFMT) {
++	case SUN4I_BACKEND_LAY_FBFMT_RGB655:
++	case SUN4I_BACKEND_LAY_FBFMT_RGB565:
++	case SUN4I_BACKEND_LAY_FBFMT_RGB556:
++	case SUN4I_BACKEND_LAY_FBFMT_ARGB1555:
++	case SUN4I_BACKEND_LAY_FBFMT_RGBA5551:
++	case SUN4I_BACKEND_LAY_FBFMT_ARGB4444:
++	case SUN4I_BACKEND_LAY_FBFMT_RGBA4444:
++		return 2;
++	case SUN4I_BACKEND_LAY_FBFMT_RGB888:
++		return 3;
++	case SUN4I_BACKEND_LAY_FBFMT_XRGB8888:
++	case SUN4I_BACKEND_LAY_FBFMT_ARGB8888:
++		return 4;
++	default:
++		return 1;
++	}
++}
++
++static bool srgn_panic_is_ram(phys_addr_t pa)
++{
++	unsigned long pfn = PHYS_PFN(pa);
++
++	return pfn_valid(pfn) && !PageHighMem(pfn_to_page(pfn));
++}
++
++/*
++ * The layer registers hold DMA bus addresses, not CPU ones: this SoC has no
++ * interconnect description, so sun4i_backend_bind() sets dma_pfn_offset and
++ * DRAM shows up at 0 on the DEBE side.  U-Boot's leftover splash layer is the
++ * one exception -- U-Boot knows nothing about that and programmed a raw CPU
++ * address (which is why only its nibble in LAYFB_H4ADD is ever non-zero).
++ * Try the translation first, fall back to the address as-is, and take
++ * whichever one lands in real lowmem.
++ */
++static bool srgn_panic_resolve(phys_addr_t bus, phys_addr_t *out)
++{
++	phys_addr_t translated = bus +
++		((phys_addr_t)srgn_panic.dma_pfn_off << PAGE_SHIFT);
++
++	if (srgn_panic_is_ram(translated)) {
++		*out = translated;
++		return true;
++	}
++
++	if (srgn_panic_is_ram(bus)) {
++		*out = bus;
++		return true;
++	}
++
++	return false;
++}
++
++/*
++ * Raw layer state, shared by the panic failure path and the sysfs knob.  When
++ * the probe below refuses everything this is the only way to see why, and
++ * reading it from a live system beats guessing from a dead one.
++ */
++static char srgn_panic_state[1024];
++
++static void srgn_panic_snapshot(void)
++{
++	size_t sz = sizeof(srgn_panic_state);
++	u32 modctl, h4add;
++	int n = 0, l;
++
++	if (!srgn_panic.regs) {
++		scnprintf(srgn_panic_state, sz, "no DEBE mapping\n");
++		return;
++	}
++
++	modctl = be_r(SUN4I_BACKEND_MODCTL_REG);
++	h4add = be_r(SUN4I_BACKEND_LAYFB_H4ADD_REG);
++
++	n += scnprintf(srgn_panic_state + n, sz - n,
++		       "modctl=%08x dissize=%08x h4add=%08x\n",
++		       modctl, be_r(SUN4I_BACKEND_DISSIZE_REG), h4add);
++
++	for (l = 0; l < SUN4I_BACKEND_NUM_LAYERS; l++) {
++		u32 lo = be_r(SUN4I_BACKEND_LAYFB_L32ADD_REG(l));
++		phys_addr_t paddr = ((phys_addr_t)(lo >> 3)) |
++			((phys_addr_t)((h4add >> (l * 8)) & 0xf) << 29);
++
++		n += scnprintf(srgn_panic_state + n, sz - n,
++			       "lay%d en=%d size=%08x lw=%08x coor=%08x attr0=%08x attr1=%08x pa=%pa\n",
++			       l, !!(modctl & SUN4I_BACKEND_MODCTL_LAY_EN(l)),
++			       be_r(SUN4I_BACKEND_LAYSIZE_REG(l)),
++			       be_r(SUN4I_BACKEND_LAYLINEWIDTH_REG(l)),
++			       be_r(SUN4I_BACKEND_LAYCOOR_REG(l)),
++			       be_r(SUN4I_BACKEND_ATTCTL_REG0(l)),
++			       be_r(SUN4I_BACKEND_ATTCTL_REG1(l)),
++			       &paddr);
++	}
++}
++
++static bool srgn_panic_probe_layer(struct srgn_panic_canvas *cv)
++{
++	u32 modctl = be_r(SUN4I_BACKEND_MODCTL_REG);
++	u32 h4add = be_r(SUN4I_BACKEND_LAYFB_H4ADD_REG);
++	int best = -1, best_c8 = -1;
++	u32 best_area = 0, best_c8_area = 0;
++	unsigned int best_bpp = 0;
++	int l;
++
++	for (l = 0; l < SUN4I_BACKEND_NUM_LAYERS; l++) {
++		u32 attr0, attr1, laysize, area;
++		unsigned int bpp;
++
++		if (!(modctl & SUN4I_BACKEND_MODCTL_LAY_EN(l)))
++			continue;
++
++		attr0 = be_r(SUN4I_BACKEND_ATTCTL_REG0(l));
++
++		/* Frontend-fed and YUV layers have no RGB buffer of their own */
++		if (attr0 & (SUN4I_BACKEND_ATTCTL_REG0_LAY_VDOEN |
++			     SUN4I_BACKEND_ATTCTL_REG0_LAY_YUVEN))
++			continue;
++
++		laysize = be_r(SUN4I_BACKEND_LAYSIZE_REG(l));
++		area = ((laysize & 0x1fff) + 1) * (((laysize >> 16) & 0x1fff) + 1);
++
++		if ((attr0 & SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_MASK) ==
++		    SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_PALETTE) {
++			if (area > best_c8_area) {
++				best_c8_area = area;
++				best_c8 = l;
++			}
++			continue;
++		}
++
++		attr1 = be_r(SUN4I_BACKEND_ATTCTL_REG1(l));
++		bpp = srgn_panic_fbfmt_bpp(attr1);
++		if (bpp < 2)
++			continue;
++
++		/*
++		 * More pixels beats more bits, since we only ever write
++		 * RGB565.  Ties break on the wider pixel, which leaves more
++		 * slack in the buffer -- never on the layer index, so this
++		 * does not care which app laid the layers out or in what
++		 * order it enabled them.
++		 */
++		if (area > best_area ||
++		    (area == best_area && bpp > best_bpp)) {
++			best_area = area;
++			best_bpp = bpp;
++			best = l;
++		}
++	}
++
++	/*
++	 * A palette layer only works as itself -- one byte per pixel leaves no
++	 * room to widen it to RGB565.
++	 */
++	cv->bpp = 2;
++	if (best < 0) {
++		if (best_c8 < 0)
++			return false;
++		best = best_c8;
++		cv->bpp = 1;
++	}
++
++	{
++		u32 laysize = be_r(SUN4I_BACKEND_LAYSIZE_REG(best));
++		u32 lo = be_r(SUN4I_BACKEND_LAYFB_L32ADD_REG(best));
++		s32 linewidth = be_r(SUN4I_BACKEND_LAYLINEWIDTH_REG(best));
++		phys_addr_t paddr;
++		s32 old_pitch, pitch;
++
++		u32 dissize = be_r(SUN4I_BACKEND_DISSIZE_REG);
++
++		cv->layer = best;
++
++		/* Nothing offscreen: we reposition the layer to the origin */
++		cv->width = min((laysize & 0x1fff) + 1, (dissize & 0xffff) + 1);
++		cv->height = min(((laysize >> 16) & 0x1fff) + 1,
++				 ((dissize >> 16) & 0xffff) + 1);
++
++		/* Both the address and the line width count bits, not bytes */
++		paddr = ((phys_addr_t)(lo >> 3)) |
++			((phys_addr_t)((h4add >> (best * 8)) & 0xf) << 29);
++		old_pitch = linewidth / 8;
++
++		/*
++		 * A negative line width means patch 0031's bottom-up scan: the
++		 * address register points at the last row.  Keep the sign, the
++		 * panel's own X mirror completes the 180 degrees and drawing in
++		 * normal coordinates comes out upright either way.
++		 */
++		if (cv->bpp == 1) {
++			/* A palette layer keeps its own stride: we do not
++			 * reprogram it, so we have to honour any padding. */
++			pitch = old_pitch;
++		} else {
++			pitch = cv->width * cv->bpp;
++			if (old_pitch < 0)
++				pitch = -pitch;
++		}
++
++		if (!cv->width || !cv->height ||
++		    abs(old_pitch) < (s32)(cv->width * cv->bpp) ||
++		    abs(old_pitch) < abs(pitch))
++			return false;
++
++		cv->pitch = pitch;
++		if (!srgn_panic_resolve(paddr, &paddr))
++			return false;
++
++		/* Both ends of the span we are about to walk must be real */
++		if (!srgn_panic_is_ram(paddr +
++				       (phys_addr_t)(cv->height - 1) * pitch))
++			return false;
++
++		cv->va = phys_to_virt(paddr);
++	}
++
++	return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* pixel plumbing                                                      */
++/* ------------------------------------------------------------------ */
++
++static void srgn_panic_hline(u32 x, u32 y, u32 w, u32 color)
++{
++	struct srgn_panic_canvas *cv = &srgn_panic_cv;
++	void *row = cv->va + (s32)y * cv->pitch;
++	u32 i;
++
++	if (cv->bpp == 1)
++		memset(row + x, color, w);
++	else
++		for (i = 0; i < w; i++)
++			((u16 *)row)[x + i] = color;
++}
++
++static void srgn_panic_fill(u32 color)
++{
++	u32 y;
++
++	for (y = 0; y < srgn_panic_cv.height; y++)
++		srgn_panic_hline(0, y, srgn_panic_cv.width, color);
++}
++
++static void srgn_panic_char(u32 cx, u32 cy, u8 ch, u32 fg, u32 bg)
++{
++	struct srgn_panic_canvas *cv = &srgn_panic_cv;
++	const u8 *glyph = srgn_panic_glyphs + (unsigned int)ch * srgn_panic_fh;
++	u32 x = cx * srgn_panic_fw;
++	u32 row, col;
++
++	for (row = 0; row < srgn_panic_fh; row++, glyph++) {
++		void *line = cv->va +
++			     (s32)(cy * srgn_panic_fh + row) * cv->pitch;
++
++		for (col = 0; col < srgn_panic_fw; col++) {
++			u32 c = (*glyph & (0x80 >> col)) ? fg : bg;
++
++			if (cv->bpp == 1)
++				((u8 *)line)[x + col] = c;
++			else
++				((u16 *)line)[x + col] = c;
++		}
++	}
++}
++
++static void srgn_panic_puts(u32 cx, u32 cy, const char *s, u32 cols,
++			    u32 fg, u32 bg)
++{
++	while (*s && cx < cols)
++		srgn_panic_char(cx++, cy, *s++, fg, bg);
++}
++
++/*
++ * A palette layer scans through the SRAM the app uploaded, so there are no
++ * colours to pick, only indices.  Read the table back and take the darkest
++ * and the brightest entry.  Rewriting the palette would corrupt whatever the
++ * app had on screen, and we might still be showing part of it.
++ */
++static void srgn_panic_pick_c8(u32 *fg, u32 *bg)
++{
++	u32 best_dark = U32_MAX, best_light = 0;
++	unsigned int i;
++
++	*bg = 0;
++	*fg = 255;
++
++	for (i = 0; i < SUN4I_BACKEND_LAY_PALETTE_SIZE / 4; i++) {
++		u32 argb = be_r(SUN4I_BACKEND_LAY_PALETTE_OFF + i * 4);
++		u32 lum = ((argb >> 16) & 0xff) + ((argb >> 8) & 0xff) * 2 +
++			  (argb & 0xff);
++
++		if (lum < best_dark) {
++			best_dark = lum;
++			*bg = i;
++		}
++		if (lum >= best_light) {
++			best_light = lum;
++			*fg = i;
++		}
++	}
++}
++
++static void srgn_panic_colors(u32 *fg, u32 *bg, u32 *accent)
++{
++	if (srgn_panic_cv.bpp == 1) {
++		srgn_panic_pick_c8(fg, bg);
++		*accent = *fg;
++	} else {
++		*fg = 0xffff;
++		*bg = 0x0000;
++		*accent = 0xf800;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* log staging                                                         */
++/* ------------------------------------------------------------------ */
++
++static void srgn_panic_push(const char *s, size_t len, u32 cols)
++{
++	size_t off = 0;
++
++	/* kmsg lines carry their newline; drop it and any trailing blanks */
++	while (len && (s[len - 1] == '\n' || s[len - 1] == '\r'))
++		len--;
++	if (!len)
++		return;
++
++	do {
++		char *dst = srgn_panic_text[srgn_panic_nlines % PANIC_MAX_ROWS];
++		size_t n = min_t(size_t, len - off, cols);
++
++		memcpy(dst, s + off, n);
++		dst[n] = '\0';
++		srgn_panic_nlines++;
++		off += n;
++	} while (off < len);
++}
++
++/* ------------------------------------------------------------------ */
++/* the dumper                                                          */
++/* ------------------------------------------------------------------ */
++
++static void srgn_panic_flush(void)
++{
++	struct srgn_panic_canvas *cv = &srgn_panic_cv;
++	void *start = cv->va;
++	size_t len = (size_t)cv->width * cv->bpp;
++
++	if (cv->pitch < 0)
++		start += (s32)(cv->height - 1) * cv->pitch;
++	len += (size_t)(cv->height - 1) * abs(cv->pitch);
++
++	/*
++	 * The splash reservation is plain cacheable lowmem while a CMA buffer
++	 * has already been remapped uncached, and we cannot tell which one we
++	 * landed on.  ARM926 is VIVT, so building an uncached alias would be
++	 * wrong -- just clean, which is a no-op on the uncached one.
++	 */
++	__cpuc_flush_dcache_area(start, len);
++	wmb();
++}
++
++/*
++ * Take over the layer we painted: force RGB565, drop everything else so no
++ * overlay (or the HWC battery block, which sits above every layer) covers the
++ * text.  Done after the pixels are in memory so no frame shows half a screen.
++ */
++static void srgn_panic_takeover(void)
++{
++	struct srgn_panic_canvas *cv = &srgn_panic_cv;
++	u32 modctl;
++	int i;
++
++	if (cv->bpp == 2) {
++		u32 attr0 = be_r(SUN4I_BACKEND_ATTCTL_REG0(cv->layer));
++		u32 attr1 = be_r(SUN4I_BACKEND_ATTCTL_REG1(cv->layer));
++
++		attr0 &= ~(SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_MASK |
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA_EN |
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_YUVEN |
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_VDOEN);
++		attr1 &= ~SUN4I_BACKEND_ATTCTL_REG1_LAY_FBFMT;
++		attr1 |= SUN4I_BACKEND_LAY_FBFMT_RGB565;
++
++		be_w(SUN4I_BACKEND_ATTCTL_REG0(cv->layer), attr0);
++		be_w(SUN4I_BACKEND_ATTCTL_REG1(cv->layer), attr1);
++		be_w(SUN4I_BACKEND_LAYLINEWIDTH_REG(cv->layer), cv->pitch * 8);
++	}
++
++	/*
++	 * Put the layer back at the origin.  The app is free to park an
++	 * overlay anywhere (this board had the RGB565 layer sitting at y=900),
++	 * and a panic screen scrolled off the bottom is no better than none.
++	 */
++	be_w(SUN4I_BACKEND_LAYCOOR_REG(cv->layer), 0);
++	be_w(SUN4I_BACKEND_LAYSIZE_REG(cv->layer),
++	     SUN4I_BACKEND_LAYSIZE(cv->width, cv->height));
++
++	modctl = be_r(SUN4I_BACKEND_MODCTL_REG);
++	modctl &= ~SUN4I_BACKEND_MODCTL_HWC_EN;
++	for (i = 0; i < SUN4I_BACKEND_NUM_LAYERS; i++)
++		modctl &= ~SUN4I_BACKEND_MODCTL_LAY_EN(i);
++	modctl |= SUN4I_BACKEND_MODCTL_LAY_EN(cv->layer) |
++		  SUN4I_BACKEND_MODCTL_DEBE_EN |
++		  SUN4I_BACKEND_MODCTL_START_CTL;
++	be_w(SUN4I_BACKEND_MODCTL_REG, modctl);
++
++	/*
++	 * Layer registers are double buffered, so what we read back above was
++	 * the shadow copy -- possibly one commit ahead of what the scanner is
++	 * really fetching.  Latching here makes that ambiguity moot: the
++	 * buffer we painted becomes the active one by definition.
++	 */
++	be_w(SUN4I_BACKEND_REGBUFFCTL_REG,
++	     SUN4I_BACKEND_REGBUFFCTL_AUTOLOAD_DIS |
++	     SUN4I_BACKEND_REGBUFFCTL_LOADCTL);
++	for (i = 0; i < 500; i++) {
++		if (!(be_r(SUN4I_BACKEND_REGBUFFCTL_REG) &
++		      SUN4I_BACKEND_REGBUFFCTL_LOADCTL))
++			break;
++		udelay(100);
++	}
++}
++
++static void srgn_panic_stop_watchdog(void)
++{
++	/*
++	 * Nothing feeds the watchdog once we are here, and this SoC's WDT
++	 * resets the whole chip with no pretimeout interrupt -- it would wipe
++	 * the screen we just drew.  Raw MMIO: the watchdog driver's accessors
++	 * are not panic-safe.
++	 */
++	if (srgn_panic.wdt)
++		writel_relaxed(0, srgn_panic.wdt + PANIC_WDT_MODE);
++}
++
++static void srgn_panic_render(enum kmsg_dump_reason reason, u32 cols, u32 rows)
++{
++	struct srgn_panic_canvas *cv = &srgn_panic_cv;
++	u32 fg, bg, accent;
++	u32 top, first, i;
++	bool logo;
++	char buf[PANIC_MAX_COLS];
++
++	srgn_panic_colors(&fg, &bg, &accent);
++	srgn_panic_fill(bg);
++
++	for (i = 0; i < srgn_panic_fh; i++)
++		srgn_panic_hline(0, i, cv->width, accent);
++	/* C8 has no spare colour for the bar, so it reuses fg: invert there */
++	srgn_panic_puts(1, 0,
++			reason == KMSG_DUMP_PANIC ? "KERNEL PANIC"
++						  : "KERNEL OOPS",
++			cols, accent == fg ? bg : fg, accent);
++
++	logo = cols >= PANIC_LOGO_MIN_COLS &&
++	       rows >= ARRAY_SIZE(srgn_panic_logo) + 4;
++	top = 1;
++
++	if (logo) {
++		for (i = 0; i < ARRAY_SIZE(srgn_panic_logo); i++)
++			srgn_panic_puts(PANIC_LOGO_X, top + i,
++					srgn_panic_logo[i], cols, fg, bg);
++		top += ARRAY_SIZE(srgn_panic_logo);
++	}
++
++	/* Beside the penguin: enough to pick the matching System.map */
++	i = logo ? 2 : 1;
++	srgn_panic_puts(logo ? PANIC_LOGO_W + 2 : 0, i++,
++			init_utsname()->release, cols, fg, bg);
++	srgn_panic_puts(logo ? PANIC_LOGO_W + 2 : 0, i++,
++			init_utsname()->version, cols, fg, bg);
++	scnprintf(buf, sizeof(buf), "DEBE layer %d  %ux%u  panic_timeout=%d",
++		  cv->layer, cv->width, cv->height, panic_timeout);
++	srgn_panic_puts(logo ? PANIC_LOGO_W + 2 : 0, i++, buf, cols, fg, bg);
++	if (!panic_timeout)
++		srgn_panic_puts(logo ? PANIC_LOGO_W + 2 : 0, i++,
++				"hold power to reset", cols, fg, bg);
++	if (i > top)
++		top = i;
++	top++;
++	if (top >= rows)
++		return;
++
++	/* Tail of the log: the last line matters most, so count back from it */
++	if (srgn_panic_nlines > rows - top)
++		first = srgn_panic_nlines - (rows - top);
++	else
++		first = 0;
++
++	for (i = first; i < srgn_panic_nlines; i++)
++		srgn_panic_puts(0, top + (i - first),
++				srgn_panic_text[i % PANIC_MAX_ROWS],
++				cols, fg, bg);
++}
++
++static void srgn_panic_dump(struct kmsg_dumper *dumper,
++			    enum kmsg_dump_reason reason)
++{
++	static char line[512];
++	struct srgn_panic_ctx *ctx = &srgn_panic;
++	size_t len;
++	u32 cols, rows;
++
++	/* An oops that turns into a panic re-enters; do not interleave blits */
++	if (cmpxchg(&ctx->in_dump, 0, 1))
++		return;
++
++	if (!ctx->regs || !srgn_panic_glyphs)
++		goto out;
++
++	memset(&srgn_panic_cv, 0, sizeof(srgn_panic_cv));
++	if (!srgn_panic_probe_layer(&srgn_panic_cv)) {
++		srgn_panic_snapshot();
++		pr_emerg("srgn_panic: no usable DEBE layer, screen left alone\n%s",
++			 srgn_panic_state);
++		goto out;
++	}
++
++	cols = min_t(u32, srgn_panic_cv.width / srgn_panic_fw,
++		     PANIC_MAX_COLS - 1);
++	rows = min_t(u32, srgn_panic_cv.height / srgn_panic_fh, PANIC_MAX_ROWS);
++	if (cols < 20 || rows < 6)
++		goto out;
++
++	/*
++	 * Rewind ourselves rather than trusting the iterator kmsg_dump() set
++	 * up: that one starts at clear_seq, so anything before the last
++	 * "dmesg -c" would be invisible.
++	 */
++	srgn_panic_nlines = 0;
++	kmsg_dump_rewind_nolock(dumper);
++	while (kmsg_dump_get_line_nolock(dumper, false, line, sizeof(line),
++					 &len))
++		srgn_panic_push(line, len, cols);
++
++	srgn_panic_render(reason, cols, rows);
++	srgn_panic_flush();
++	srgn_panic_takeover();
++	srgn_panic_stop_watchdog();
++out:
++	ctx->in_dump = 0;
++}
++
++static struct kmsg_dumper srgn_panic_dumper = {
++	.dump		= srgn_panic_dump,
++	.max_reason	= KMSG_DUMP_OOPS,
++};
++
++/* ------------------------------------------------------------------ */
++/* setup                                                               */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Bring-up trigger.  MAGIC_SYSRQ is off in this defconfig and an out-of-tree
++ * test module would need a whole buildroot package, so keep a root-only knob
++ * here: 1 = panic, 2 = BUG, 3 = NULL deref (oops path), 4 = WARN (must NOT
++ * paint -- WARN does not run kmsg dumpers).
++ */
++static ssize_t test_store(struct kobject *kobj, struct kobj_attribute *attr,
++			  const char *buf, size_t count)
++{
++	int mode;
++
++	if (kstrtoint(buf, 0, &mode))
++		return -EINVAL;
++
++	switch (mode) {
++	case 1:
++		panic("srgn_panic: test trigger\n");
++		break;
++	case 2:
++		BUG();
++		break;
++	case 3:
++		*(volatile u32 *)16 = 0;
++		break;
++	case 4:
++		WARN(1, "srgn_panic: warn trigger\n");
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return count;
++}
++
++static struct kobj_attribute srgn_panic_test_attr =
++	__ATTR(test, 0200, NULL, test_store);
++
++/* Same probe the dumper runs, minus the dying, so it can be checked live */
++static ssize_t state_show(struct kobject *kobj, struct kobj_attribute *attr,
++			  char *buf)
++{
++	struct srgn_panic_canvas cv = {};
++	bool ok;
++
++	srgn_panic_snapshot();
++	ok = srgn_panic_probe_layer(&cv);
++
++	if (!ok)
++		return scnprintf(buf, PAGE_SIZE, "%sverdict: no usable layer\n",
++				 srgn_panic_state);
++
++	return scnprintf(buf, PAGE_SIZE,
++			 "%sverdict: layer %d %ux%u pitch %d bpp %u va %p\n",
++			 srgn_panic_state, cv.layer, cv.width, cv.height,
++			 cv.pitch, cv.bpp, cv.va);
++}
++
++static struct kobj_attribute srgn_panic_state_attr =
++	__ATTR(state, 0444, state_show, NULL);
++
++static struct attribute *srgn_panic_attrs[] = {
++	&srgn_panic_test_attr.attr,
++	&srgn_panic_state_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group srgn_panic_group = {
++	.attrs = srgn_panic_attrs,
++};
++
++static void srgn_panic_test_init(void)
++{
++	struct kobject *kobj;
++
++	kobj = kobject_create_and_add("srgn_panic", kernel_kobj);
++	if (!kobj)
++		return;
++
++	if (sysfs_create_group(kobj, &srgn_panic_group)) {
++		kobject_put(kobj);
++		return;
++	}
++
++	srgn_panic.kobj = kobj;
++}
++
++static void srgn_panic_map_watchdog(void)
++{
++	struct device_node *np;
++
++	np = of_find_compatible_node(NULL, NULL, "allwinner,sun6i-a31-wdt");
++	if (!np)
++		return;
++
++	srgn_panic.wdt = of_iomap(np, 0);
++	of_node_put(np);
++}
++
++void srgn_panic_init(struct device *dev, struct device *dma_dev,
++		     struct sun4i_backend *backend, void __iomem *regs)
++{
++	if (srgn_panic.backend)
++		return;
++
++	srgn_panic_glyphs = font_6x10.data;
++	srgn_panic_fw = font_6x10.width;
++	srgn_panic_fh = font_6x10.height;
++	srgn_panic.backend = backend;
++	srgn_panic.regs = regs;
++	srgn_panic.dma_pfn_off = dma_dev->dma_pfn_offset;
++	srgn_panic_map_watchdog();
++	srgn_panic_test_init();
++
++	if (kmsg_dump_register(&srgn_panic_dumper))
++		dev_warn(dev, "could not register the panic screen dumper\n");
++	else
++		dev_info(dev, "panic screen armed\n");
++}
++
++void srgn_panic_fini(struct sun4i_backend *backend)
++{
++	struct srgn_panic_ctx *ctx = &srgn_panic;
++
++	if (ctx->backend != backend)
++		return;
++
++	kmsg_dump_unregister(&srgn_panic_dumper);
++
++	if (ctx->kobj) {
++		sysfs_remove_group(ctx->kobj, &srgn_panic_group);
++		kobject_put(ctx->kobj);
++	}
++	if (ctx->wdt)
++		iounmap(ctx->wdt);
++
++	memset(ctx, 0, sizeof(*ctx));
++}
