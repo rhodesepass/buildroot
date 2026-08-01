@@ -14,7 +14,7 @@ if BR2_PACKAGE_EPASS_FONTS
 
 config BR2_PACKAGE_EPASS_FONTS_CHARSET_FILES
 	string "CJK charset files"
-	default "board/rhodesisland/epass/fonts/charset/common.txt board/rhodesisland/epass/fonts/charset/operators.txt board/rhodesisland/epass/fonts/charset/literals.txt"
+	default "board/rhodesisland/epass/fonts/charset/common.txt board/rhodesisland/epass/fonts/charset/operators.txt board/rhodesisland/epass/fonts/charset/literals.txt board/rhodesisland/epass/fonts/charset/anime_games.txt"
 	help
 	  Space-separated list of UTF-8 text files. Every character in
 	  these files is kept in the subsetted CJK fonts (body/title).
