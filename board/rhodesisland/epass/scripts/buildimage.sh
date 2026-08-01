@@ -18,8 +18,9 @@ echo ============ start building NAND image ============
 
 echo "building rootfs..."
 fakeroot sh -c "tar xf rootfs.tar -C rootfs/"
-fakeroot sh -c 'mkfs.ubifs -x lzo -F -m 2048 -e 126976 -c 922 -o rootfs_ubifs.img -r rootfs'
-fakeroot sh -c 'ubinize -o rootfs_ubi.img -m 2048 -p 131072 -O 2048 -s 2048 ubinize-rootfs.cfg -v'
+# -c 199 与 ubinize-rootfs.cfg 的 rootfs 卷 24MiB(199 LEB)匹配
+fakeroot sh -c 'mkfs.ubifs -x lzo -F -m 2048 -e 126976 -c 199 -o rootfs_ubifs.img -r rootfs' || exit 1
+fakeroot sh -c 'ubinize -o rootfs_ubi.img -m 2048 -p 131072 -O 2048 -s 2048 ubinize-rootfs.cfg -v' || exit 1
 
 echo "building DTBs and kernel FIT images..."
 cd "${BINARIES_DIR}"
@@ -90,6 +91,39 @@ otherwise the device may boot with a wrong device tree / screen driver.
 Do not touch dtbs.itb / kernel.itb.
 EOF
 "${HOST_DIR}/bin/mcopy" -i bootfs.vfat README.txt ::README.txt
+
+echo "building SD rootfs container (squashfs-in-ext4)..."
+# 容器 = p2 上的 ext4, 内容: 只读系统 rootfs.squashfs + 一套最小 busybox 环境。
+# 后者不可省: init=/preinit 是在容器根上解析的, 此时 squashfs 还没挂载,
+# preinit 及其用到的 sh/mount/pivot_root 只能来自容器自身(busybox+musl 约 1.4M)。
+# 另带 mke2fs(+e2fsprogs 库): preinit 首启/自愈时格式化 p3 data 分区用。
+# overlay upper 在 p3 上, 不在容器里 -- DFU 重写 p2 不动用户数据。
+rm -rf sdroot
+rm -f rootfs.ext4
+mkdir -p sdroot/bin sdroot/sbin sdroot/lib sdroot/etc sdroot/dev sdroot/proc \
+    sdroot/sys sdroot/rom sdroot/overlay sdroot/newroot
+cp rootfs/bin/busybox sdroot/bin/busybox || exit 1
+for app in sh mount umount cat mkdir pivot_root; do
+    ln -s busybox "sdroot/bin/${app}" || exit 1
+done
+cp rootfs/lib/libc.so sdroot/lib/libc.so || exit 1
+ln -s libc.so sdroot/lib/ld-musl-arm.so.1
+cp rootfs/sbin/mke2fs sdroot/sbin/mke2fs || exit 1
+cp rootfs/etc/mke2fs.conf sdroot/etc/mke2fs.conf || exit 1
+# mke2fs 的动态库: musl 加载器默认搜 /lib, 全部平铺进去(保留 so 名字链)
+cp -a rootfs/lib/libblkid.so.1* rootfs/lib/libuuid.so.1* \
+    rootfs/usr/lib/libext2fs.so.2* rootfs/usr/lib/libcom_err.so.2* \
+    rootfs/usr/lib/libe2p.so.2* sdroot/lib/ || exit 1
+cp rootfs/preinit sdroot/preinit || exit 1
+cp rootfs.squashfs sdroot/rootfs.squashfs || exit 1
+
+squashfs_size=$(wc -c < rootfs.squashfs)
+container_mib=$(( squashfs_size / 1048576 + 1 + 16 ))
+truncate -s "${container_mib}M" rootfs.ext4 || exit 1
+# -O ^64bit 沿用旧 BR2_TARGET_ROOTFS_EXT2_MKFS_OPTIONS 的取值
+fakeroot sh -c "chown -R 0:0 sdroot && \
+    '${HOST_DIR}/sbin/mkfs.ext4' -F -q -O ^64bit -L rootfs -d sdroot rootfs.ext4" || exit 1
+rm -rf sdroot
 
 echo ============ start building SD Card image ============
 python3 gensdimage.py

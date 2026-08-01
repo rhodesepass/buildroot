@@ -1,19 +1,103 @@
 #!/bin/sh
-mount proc /proc -t proc
-set -- $(cat /proc/cmdline)
-umount /proc
-for x in "$@"; do
+#
+# overlayfs preinit (PID 1, 由 bootargs 的 init=/preinit 进入)
+#
+# 把 / 拼成 overlay: 只读 lower(系统) + 可写 upper(数据), 再 pivot_root 进真根。
+# 数据与系统分属不同分区, DFU 刷机(uboot/boot/rootfs 三个 alt)只重写系统,
+# 数据分区从不被刷机触碰 -- 全刷即保数据升级。
+#
+# 两条路径统一 upper=/overlay/upper, work=/overlay/work, 差异只在:
+#   NAND: lower = 内核挂好的 ro UBIFS 根(ubi0 = rootfs 分区),
+#         /overlay = ubi1(data 分区, 由 ubi.mtd=data 附加)的 rootfs_data 卷
+#   SD:   lower = 容器里 loop 挂载的 /rootfs.squashfs (容器=p2),
+#         /overlay = p3 data 分区(ext4)
+#
+# 数据分区挂不上(首刷/迁移残留/介质损坏)就地重建 -- 相当于数据出厂化,
+# 系统不受影响; 重建再失败才 die。
+#
+# 用 pivot_root 而不是 chroot: 旧根规整地留在新根的 /rom 下,
+# /proc/mounts 里所有挂载点都可达, S00sdsetup 的 resize2fs 在线扩容
+# 才能正确定位 ext4 容器(chroot 会把容器挂载点藏在根外)。
+#
+# die: kmsg 留原因后 PID 1 退出 -> 内核 panic -> srgn_panic 把日志尾部
+# (含原因)画上屏幕。不做兜底启动, 不留半坏状态。
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+
+die() {
+    echo "preinit: $*" > /dev/kmsg
+    echo "preinit: $*"
+    exit 1
+}
+
+mount -t proc proc /proc || die "cannot mount /proc"
+# ubi 工具(libubi/libmtd)靠 /sys/class/ubi、/sys/class/mtd 工作,
+# 不挂 sysfs 会报 "UBI is not present in the system"
+mount -t sysfs sysfs /sys || die "cannot mount /sys"
+root=
+for x in $(cat /proc/cmdline); do
     case "$x" in
-        overlayfsdev=*)
-        OVERLAYFSDEV="${x#overlayfsdev=}"
-        mount -n -t jffs2 ${OVERLAYFSDEV} -o rw,noatime /overlay
-        mkdir -p /overlay/rom/lower /overlay/rom/upper /overlay/rom/work
-        mount --rbind / /overlay/rom/lower
-        mount -n -t overlay overlayfs:/overlay/rom -o rw,noatime,lowerdir=/overlay/rom/lower,upperdir=/overlay/rom/upper,workdir=/overlay/rom/work /tmp
-        mount --rbind /dev /tmp/dev/
-        mount --rbind /overlay /tmp/overlay/
-        exec chroot /tmp /sbin/init
-        ;;
+        root=*) root="${x#root=}" ;;
     esac
 done
+
+case "$root" in
+    ubi*)
+        if ! mount -t ubifs -o rw,noatime ubi1:rootfs_data /overlay; then
+            echo "preinit: rootfs_data mount failed, rebuilding data partition" > /dev/kmsg
+            mtdnum=$(sed -n 's/^mtd\([0-9]*\):.*"data"$/\1/p' /proc/mtd)
+            [ -n "$mtdnum" ] || die "no data mtd partition"
+            ubidetach -m "$mtdnum" 2> /dev/null
+            # ubiformat 保留擦除计数和坏块表; 重建后 attach 得到最小空闲号 ubi1
+            ubiformat -y -q "/dev/mtd${mtdnum}" || die "ubiformat data failed"
+            ubiattach -m "$mtdnum" || die "ubiattach data failed"
+            ubimkvol /dev/ubi1 -N rootfs_data -m || die "ubimkvol rootfs_data failed"
+            mount -t ubifs -o rw,noatime ubi1:rootfs_data /overlay \
+                || die "rootfs_data mount failed after rebuild"
+        fi
+        lower=/
+        ;;
+    /dev/mmcblk*)
+        mount -o loop,ro -t squashfs /rootfs.squashfs /rom \
+            || die "cannot mount /rootfs.squashfs"
+        if ! mount -t ext4 -o rw,noatime /dev/mmcblk0p3 /overlay; then
+            echo "preinit: data partition mount failed, formatting" > /dev/kmsg
+            mke2fs -F -q -t ext4 -O ^64bit -L data /dev/mmcblk0p3 \
+                || die "mke2fs data failed"
+            mount -t ext4 -o rw,noatime /dev/mmcblk0p3 /overlay \
+                || die "data mount failed after mkfs"
+        fi
+        lower=/rom
+        ;;
+    *)
+        die "unsupported root=$root"
+        ;;
+esac
+umount /sys
+umount /proc
+
+# 恢复出厂: system_maintenance 在 upper 根放下标志就重启, 真正的清理只能在
+# overlay 挂上之前做 -- 运行中的根就是这个 overlay, upper 里躺着正在执行的
+# 二进制, overlayfs 也不允许从底下改动 upper/work。
+# 删整个目录再重建, 不用 upper/* 通配(会漏隐藏文件); 标志在 upper 里一并被
+# 删掉, 天然自消, 不会反复重置。清到一半断电最坏是下次开机再清一遍。
+if [ -e /overlay/upper/.factory_reset ]; then
+    echo "preinit: factory reset, wiping upper" > /dev/kmsg
+    rm -rf /overlay/upper /overlay/work || die "factory reset failed"
+fi
+
+mkdir -p /overlay/upper /overlay/work || die "cannot create upper/work"
+mount -t overlay overlayfs:root \
+    -o "rw,noatime,lowerdir=$lower,upperdir=/overlay/upper,workdir=/overlay/work" \
+    /newroot || die "overlay mount failed"
+
+cd /newroot || die "cannot cd /newroot"
+pivot_root . rom || die "pivot_root failed"
+
+# 旧根现在在 /rom: 把 devtmpfs 和 upper 存储挪进新根
+mount -o move /rom/dev /dev || die "move /dev failed"
+mount -o move /rom/overlay /overlay || die "move /overlay failed"
+
 exec /sbin/init
+die "cannot exec /sbin/init"
