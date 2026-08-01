@@ -8,20 +8,6 @@
 		bootargs = "i luv mostima";
 	};
 
-	/* 360x640 scanout */
-	reserved-memory {
-		#address-cells = <1>;
-		#size-cells = <1>;
-		ranges;
-
-		linux,cma {
-			compatible = "shared-dma-pool";
-			reusable;
-			size = <0x1000000>; /* 16 MiB */
-			linux,cma-default;
-		};
-	};
-
 	reg_vcc3v3: vcc3v3 {
 		compatible = "regulator-fixed";
 		regulator-name = "vcc3v3";

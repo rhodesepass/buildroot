@@ -1,0 +1,105 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] mtd: nand: make "mtd erase.dontskipbad" actually force the erase
+
+cmd/mtd.c already sets erase_info::scrub for the .dontskipbad variant, but
+nothing downstream looks at it: spinand_mtd_erase() -> nanddev_mtd_erase()
+always goes through nanddev_erase(), which refuses any block the BBM or the
+in-RAM BBT says is bad. So on SPI-NAND the option is a no-op and factory bad
+block markers can never be wiped.
+
+Add nanddev_erase_force(): erase unconditionally, then re-derive the bad block
+state from the erase result alone - only a block that fails to erase is still
+bad, and it gets its BBM written back. The in-RAM BBT entry is refreshed both
+ways, otherwise a block whose marker was just wiped would stay bad for the rest
+of the session (nanddev_isbad() consults the BBT cache first).
+
+This is what the epass factory flow needs: wipe the whole chip, then let the
+bad block table be rebuilt from scratch.
+
+diff --git a/cmd/mtd.c b/cmd/mtd.c
+--- a/cmd/mtd.c
++++ b/cmd/mtd.c
+@@ -436,8 +436,12 @@
+ 			/* Abort if its not a bad block error */
+ 			if (ret != -EIO)
+ 				break;
+-			printf("Skipping bad block at 0x%08llx\n",
+-			       erase_op.addr);
++			if (scrub)
++				printf("Bad block at 0x%08llx (erase failed, marked bad)\n",
++				       erase_op.addr);
++			else
++				printf("Skipping bad block at 0x%08llx\n",
++				       erase_op.addr);
+ 		}
+ 
+ 		len -= mtd->erasesize;
+diff --git a/drivers/mtd/nand/core.c b/drivers/mtd/nand/core.c
+--- a/drivers/mtd/nand/core.c
++++ b/drivers/mtd/nand/core.c
+@@ -141,6 +141,44 @@
+ EXPORT_SYMBOL_GPL(nanddev_erase);
+ 
+ /**
++ * nanddev_erase_force() - Erase a block ignoring its current bad block state
++ * @nand: NAND device
++ * @pos: position of the block to erase
++ *
++ * Erases the block even when it is marked bad, then re-derives the bad block
++ * state from the erase result: only a block that fails to erase is still bad.
++ * Used to wipe factory bad block markers and rediscover the real bad blocks.
++ *
++ * nanddev_markbad() is deliberately not reused here - it returns early when
++ * nanddev_isbad() hits, which is exactly the state being rebuilt, so the BBM
++ * would never make it back to the chip.
++ *
++ * Return: 0 in case of success, a negative error code otherwise.
++ */
++int nanddev_erase_force(struct nand_device *nand, const struct nand_pos *pos)
++{
++	struct mtd_info *mtd = nanddev_to_mtd(nand);
++	int ret;
++
++	ret = nand->ops->erase(nand, pos);
++	if (ret) {
++		nand->ops->markbad(nand, pos);
++		mtd->ecc_stats.badblocks++;
++	}
++
++	if (nanddev_bbt_is_initialized(nand)) {
++		unsigned int entry = nanddev_bbt_pos_to_entry(nand, pos);
++
++		nanddev_bbt_set_block_status(nand, entry,
++					     ret ? NAND_BBT_BLOCK_WORN :
++						   NAND_BBT_BLOCK_GOOD);
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(nanddev_erase_force);
++
++/**
+  * nanddev_mtd_erase() - Generic mtd->_erase() implementation for NAND devices
+  * @mtd: MTD device
+  * @einfo: erase request
+@@ -164,7 +202,8 @@
+ 	nanddev_offs_to_pos(nand, einfo->addr, &pos);
+ 	nanddev_offs_to_pos(nand, einfo->addr + einfo->len - 1, &last);
+ 	while (nanddev_pos_cmp(&pos, &last) <= 0) {
+-		ret = nanddev_erase(nand, &pos);
++		ret = einfo->scrub ? nanddev_erase_force(nand, &pos) :
++				     nanddev_erase(nand, &pos);
+ 		if (ret) {
+ 			einfo->fail_addr = nanddev_pos_to_offs(nand, &pos);
+ 
+diff --git a/include/linux/mtd/nand.h b/include/linux/mtd/nand.h
+--- a/include/linux/mtd/nand.h
++++ b/include/linux/mtd/nand.h
+@@ -678,6 +678,7 @@
+ bool nanddev_isbad(struct nand_device *nand, const struct nand_pos *pos);
+ bool nanddev_isreserved(struct nand_device *nand, const struct nand_pos *pos);
+ int nanddev_erase(struct nand_device *nand, const struct nand_pos *pos);
++int nanddev_erase_force(struct nand_device *nand, const struct nand_pos *pos);
+ int nanddev_markbad(struct nand_device *nand, const struct nand_pos *pos);
+ 
+ /* BBT related functions */

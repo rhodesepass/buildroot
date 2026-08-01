@@ -10,7 +10,7 @@ index 192b3b26..8821df7f 100644
 +	bool "mstmchk"
 +	default y
 +	help
-+	  Check Mostima marker at 0x80000000 and set mstm_ret env var
++	  Check Mostima marker at 0x80000000 and set mstm_ret/mstm_flags env vars
 +
  config MP
  	bool "support for multiprocessor"
@@ -32,11 +32,12 @@ new file mode 100644
 index 00000000..c4e8f1a2
 --- /dev/null
 +++ b/cmd/mstmchk.c
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,59 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Check Mostima marker at fixed DRAM address.
-+ * Sets mstm_ret env var (0 = no marker, 1/2 = type byte).
++ * Sets mstm_ret env var (0 = no marker, 1/2 = type byte) and mstm_flags
++ * (flashing policy bits from header byte 9, 0 when no marker).
 + * Do not use command return code: U-Boot $? is only 0/1.
 + */
 +
@@ -53,15 +54,16 @@ index 00000000..c4e8f1a2
 +{
 +	void *buf;
 +	u64 magic;
-+	u8 next;
-+	char val[4];
++	u8 next, flags;
++	char val[8];
 +
 +	if (argc != 1)
 +		return CMD_RET_USAGE;
 +
 +	env_set("mstm_ret", "0");
++	env_set("mstm_flags", "0");
 +
-+	buf = map_sysmem(MSTMCHK_ADDR, 9);
++	buf = map_sysmem(MSTMCHK_ADDR, 10);
 +	if (!buf)
 +		return CMD_RET_SUCCESS;
 +
@@ -72,10 +74,15 @@ index 00000000..c4e8f1a2
 +	}
 +
 +	next = *((u8 *)buf + 8);
++	flags = *((u8 *)buf + 9);
 +	unmap_sysmem(buf);
 +
 +	snprintf(val, sizeof(val), "%u", next);
 +	env_set("mstm_ret", val);
++
++	/* setexpr parses its operands as hex, so hand it something unambiguous */
++	snprintf(val, sizeof(val), "0x%x", flags);
++	env_set("mstm_flags", val);
 +
 +	return CMD_RET_SUCCESS;
 +}

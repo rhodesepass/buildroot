@@ -69,9 +69,19 @@
 				reg = <0x100000 0x600000>;
 			};
 
+			/*
+			 * 与 linux 侧 epass_common.dtsi 保持一致:
+			 * rootfs(系统) + data(overlay upper) 两个分区,
+			 * DFU "rootfs partubi 4" 只重写系统, 刷机保数据
+			 */
 			partition@700000 {
 				label = "rootfs";
-				reg = <0x700000 0x7900000>;
+				reg = <0x700000 0x1c00000>;
+			};
+
+			partition@2300000 {
+				label = "data";
+				reg = <0x2300000 0x5d00000>;
 			};
 		};
 	};

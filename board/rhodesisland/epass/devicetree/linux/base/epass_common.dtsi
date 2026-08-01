@@ -18,6 +18,23 @@
 		ranges;
 	};
 
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * this CMA size will be changed by U-Boot according to the detected DRAM size.
+		 * For 32M board, the size will be 16M; for 64M board, the size will be 32M.
+		 */
+		linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x1000000>; /* 16 MiB */
+			linux,cma-default;
+		};
+	};
+
 	backlight {
 		compatible = "pwm-backlight";
 		pwms = <&pwm 0 10000 0>;
@@ -101,9 +118,16 @@
 				reg = <0x100000 0x600000>;
 			};
 
+			/* lower layer of overlayfs */
 			partition@700000 {
 				label = "rootfs";
-				reg = <0x700000 0x7900000>;
+				reg = <0x700000 0x1c00000>;
+			};
+
+			/* upper layer of overlayfs */
+			partition@2300000 {
+				label = "data";
+				reg = <0x2300000 0x5d00000>;
 			};
 		};
 	};

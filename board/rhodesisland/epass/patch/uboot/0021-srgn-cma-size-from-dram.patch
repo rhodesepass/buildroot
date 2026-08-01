@@ -1,0 +1,71 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] srgn: size the kernel CMA pool from the probed DRAM size
+
+The CMA pool size is a DRAM-size decision, not a board-revision one: the
+32M (F1C100s) and 64M (F1C200s) parts share one kernel device tree, and
+until now each board dtsi carried its own hardcoded linux,cma size. That
+breaks as soon as a revision ships with either die.
+
+Reserved-memory sizing cannot be made self-adjusting on the kernel side
+either -- memblock happily satisfies an oversized reservation and starves
+the kernel instead of failing. U-Boot already knows the real size from
+the DRAM probe, so patch it into the blob in ft_board_setup, after the
+overlays have been applied.
+
+The DT keeps the smaller 16M value as its default so that a board still
+boots if this fixup never runs.
+
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -917,6 +917,42 @@
+ 	return 0;
+ }
+ 
++/*
++ * Grow the kernel's default CMA pool to 32M on the 64M parts. The node is
++ * located by its linux,cma-default property rather than by path so that
++ * adding further reserved regions later does not silently pick the wrong one.
++ */
++static void srgn_fixup_cma_size(void *blob)
++{
++	int rmem, node;
++	u32 size;
++
++	rmem = fdt_path_offset(blob, "/reserved-memory");
++	if (rmem < 0)
++		return;
++
++	size = (gd->ram_size > 32 * 1024 * 1024) ? (32 << 20) : (16 << 20);
++
++	fdt_for_each_subnode(node, blob, rmem) {
++		int ret;
++
++		if (!fdt_getprop(blob, node, "linux,cma-default", NULL))
++			continue;
++
++		ret = fdt_setprop_u32(blob, node, "size", size);
++		if (ret)
++			printf("srgn: CMA fixup failed: %s\n",
++			       fdt_strerror(ret));
++		else
++			printf("srgn: CMA %u MiB (DRAM %lu MiB)\n",
++			       size >> 20,
++			       (unsigned long)(gd->ram_size >> 20));
++		return;
++	}
++
++	printf("srgn: no linux,cma-default node, CMA fixup skipped\n");
++}
++
+ int ft_board_setup(void *blob, bd_t *bd)
+ {
+ 	int __maybe_unused r;
+@@ -927,6 +963,8 @@
+ 	 */
+ 	setup_environment(blob);
+ 
++	srgn_fixup_cma_size(blob);
++
+ #ifdef CONFIG_VIDEO_DT_SIMPLEFB
+ 	r = sunxi_simplefb_setup(blob);
+ 	if (r)
