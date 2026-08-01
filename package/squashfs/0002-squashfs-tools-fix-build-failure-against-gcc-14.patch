@@ -1,0 +1,61 @@
+From: shirogane <shirogane@localhost>
+Subject: [PATCH] squashfs-tools: fix build failure against gcc-14
+
+gcc-14 promotes -Wincompatible-pointer-types to an error, and the
+old-style empty parameter list signal handlers no longer match
+__sighandler_t (void (*)(int)). Add the int parameter.
+
+diff --git a/squashfs-tools/mksquashfs.c b/squashfs-tools/mksquashfs.c
+--- a/squashfs-tools/mksquashfs.c
++++ b/squashfs-tools/mksquashfs.c
+@@ -425,7 +425,7 @@
+ }
+ 
+ 
+-void sighandler()
++void sighandler(int sig)
+ {
+ 	EXIT_MKSQUASHFS();
+ }
+diff --git a/squashfs-tools/unsquashfs.c b/squashfs-tools/unsquashfs.c
+--- a/squashfs-tools/unsquashfs.c
++++ b/squashfs-tools/unsquashfs.c
+@@ -131,7 +131,7 @@
+ }
+ 
+ 
+-void sigwinch_handler()
++void sigwinch_handler(int sig)
+ {
+ 	struct winsize winsize;
+ 
+@@ -145,7 +145,7 @@
+ }
+ 
+ 
+-void sigalrm_handler()
++void sigalrm_handler(int sig)
+ {
+ 	rotate = (rotate + 1) % 4;
+ }
+diff --git a/squashfs-tools/progressbar.c b/squashfs-tools/progressbar.c
+--- a/squashfs-tools/progressbar.c
++++ b/squashfs-tools/progressbar.c
+@@ -52,7 +52,7 @@
+ pthread_mutex_t progress_mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
+ 
+-static void sigwinch_handler()
++static void sigwinch_handler(int sig)
+ {
+ 	struct winsize winsize;
+ 
+@@ -66,7 +66,7 @@
+ }
+ 
+ 
+-static void sigalrm_handler()
++static void sigalrm_handler(int sig)
+ {
+ 	rotate = (rotate + 1) % 4;
+ }
