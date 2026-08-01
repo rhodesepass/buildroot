@@ -83,7 +83,9 @@ supervise() {
     fi
 
     while true; do
-        chmod +x "$APP" 2> /dev/null
+        # 不能无条件 chmod: overlayfs 上对 lower 文件 setattr 会整文件
+        # copy-up 进 upper, 之后刷 lower 就更新不到这个 app 了
+        [ -x "$APP" ] || chmod +x "$APP" 2> /dev/null
         log "starting $APP"
         "$APP" > /dev/null 2>&1
         ret=$?

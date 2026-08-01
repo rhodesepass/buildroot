@@ -1,20 +1,21 @@
 #!/bin/sh
 #
 # SD 启动首次开机初始化
-#   - rootfs 镜像只烧写 20M,在线扩容 ext4 到整个 rootfs 分区
-#   - share 分区(mmcblk0p3)扩容:
+#   - rootfs 容器(p2)在线扩容 ext4 到整个分区
+#   - share 分区(mmcblk0p4)扩容:
 #     xfel 路径由 U-Boot sdflash 按卡实际容量写 MBR,天然正确;
-#     dd 整卡镜像(sd_image.img)里 p3 的 size 写的是"到 2TB 上限",
+#     dd 整卡镜像(sd_image.img)里 p4 的 size 写的是"到 2TB 上限",
 #     内核解析时会截断到卡的实际末尾,这里把盘上 MBR 的 size 字段
 #     改成实际值,让分区表在读卡器上看也是自洽的
 #   - share 分区还没有文件系统时格式化成 FAT
+# (data 分区 p3 由 preinit 负责,不在本脚本范围)
 # 三步都是幂等的,非首次开机时基本无开销。
 
 DISK=/dev/mmcblk0
 ROOT_DEV=/dev/mmcblk0p2
-SHARE_DEV=/dev/mmcblk0p3
-# MBR 第 3 个分区表项的 size 字段偏移: 446 + 2*16 + 12
-SHARE_SIZE_OFF=490
+SHARE_DEV=/dev/mmcblk0p4
+# MBR 第 4 个分区表项的 size 字段偏移: 446 + 3*16 + 12
+SHARE_SIZE_OFF=506
 
 log() {
     echo "sdsetup: $*" > /dev/kmsg
@@ -22,8 +23,8 @@ log() {
 
 fix_share_size() {
     total=$(cat /sys/block/mmcblk0/size 2> /dev/null)
-    start=$(cat /sys/block/mmcblk0/mmcblk0p3/start 2> /dev/null)
-    runtime=$(cat /sys/block/mmcblk0/mmcblk0p3/size 2> /dev/null)
+    start=$(cat /sys/block/mmcblk0/mmcblk0p4/start 2> /dev/null)
+    runtime=$(cat /sys/block/mmcblk0/mmcblk0p4/size 2> /dev/null)
     [ -n "$total" ] && [ -n "$start" ] && [ -n "$runtime" ] || return
 
     desired=$((total - start))
@@ -31,7 +32,7 @@ fix_share_size() {
     [ "$ondisk" = "$desired" ] && return
 
     # 内核运行时大小应已被截断成 desired;若不是,说明不是
-    # "镜像 p3 写到上限被截断" 这种情况,不要乱动分区表
+    # "镜像 p4 写到上限被截断" 这种情况,不要乱动分区表
     if [ "$runtime" != "$desired" ]; then
         log "share size mismatch (disk=$ondisk runtime=$runtime want=$desired), MBR untouched"
         return

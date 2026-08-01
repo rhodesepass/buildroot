@@ -7,10 +7,11 @@ LOCK=/var/run/sdmount.lock
 [ "$SDMOUNT_LOCKED" ] || { SDMOUNT_LOCKED=1 exec flock "$LOCK" "$0" "$@"; }
 
 # NAND 启动时外置 SD 卡是 mmcblk0p1;
-# SD 启动时系统本身在 SD 上, /sd 对应第三个 share 分区
+# SD 启动时系统本身在 SD 上, /sd 对应第四个 share 分区
+# (p3 是 overlay 数据分区, 归 preinit 管)
 sd_dev() {
     if grep -q 'root=/dev/mmcblk0p2' /proc/cmdline; then
-        echo /dev/mmcblk0p3
+        echo /dev/mmcblk0p4
     else
         echo /dev/mmcblk0p1
     fi

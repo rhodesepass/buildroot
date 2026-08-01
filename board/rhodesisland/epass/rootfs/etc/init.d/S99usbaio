@@ -12,9 +12,10 @@ log() {
     echo "usb_aio: $*" > /dev/kmsg
 }
 
-# 等待 app_360 或 app_720 任一进程出现
 wait_for_app() {
-    while ! pidof app_360 > /dev/null 2>&1 && ! pidof app_720 > /dev/null 2>&1; do
+    while ! pidof app_360 > /dev/null 2>&1 \
+        && ! pidof app_720 > /dev/null 2>&1 \
+        && ! pidof quick_start > /dev/null 2>&1; do
         sleep 1
     done
 }
@@ -24,7 +25,7 @@ start() {
     command -v usb_aio_handler > /dev/null || exit 0
     # 后台等待主 app 启动后再延迟拉起
     (
-        log "waiting for app_360 or app_720"
+        log "waiting for app_360 / app_720 / quick_start"
         wait_for_app
         sleep "$POST_APP_DELAY"
         log "starting usb_aio_handler (app up + ${POST_APP_DELAY}s)"
