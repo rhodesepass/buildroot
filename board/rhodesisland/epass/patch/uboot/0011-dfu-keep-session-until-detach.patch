@@ -1,5 +1,17 @@
-diff --git a/common/dfu.c b/common/dfu.c
-index 491cd93a..4e457788 100644
+From: epass
+Subject: [PATCH] dfu: keep one USB session for the whole flashing run
+
+dfu-util's -R / --detach used to be turned into a board reset by upstream.
+We don't want that: the dfu command should just return so the boot script
+can carry on with distro_bootcmd.
+
+With the reset gone, a single `dfu` invocation serves every alt setting in
+a row and the gadget is never unregistered mid-flash, so the device
+enumerates exactly once per flashing run. This matters for WebUSB and
+Android, where every re-enumeration costs the user another permission
+prompt. The host ends the session by sending DFU_DETACH (dfu-util -e)
+after the last partition.
+
 --- a/common/dfu.c
 +++ b/common/dfu.c
 @@ -22,7 +22,6 @@
@@ -10,11 +22,10 @@ index 491cd93a..4e457788 100644
  	int ret, i = 0;
  
  	ret = usb_gadget_initialize(usbctrl_index);
-@@ -43,16 +42,6 @@ int run_usb_dnl_gadget(int usbctrl_index, char *usb_dnl_gadget)
- 
+@@ -44,16 +43,6 @@
  	while (1) {
  		if (g_dnl_detach()) {
--			/*
+ 			/*
 -			 * Check if USB bus reset is performed after detach,
 -			 * which indicates that -R switch has been passed to
 -			 * dfu-util. In this case reboot the device
@@ -24,10 +35,11 @@ index 491cd93a..4e457788 100644
 -				goto exit;
 -			}
 -
- 			/*
+-			/*
  			 * This extra number of usb_gadget_handle_interrupts()
  			 * calls is necessary to assure correct transmission
-@@ -104,9 +94,6 @@ exit:
+ 			 * completion with dfu-util
+@@ -105,9 +94,6 @@
  	g_dnl_unregister();
  	usb_gadget_release(usbctrl_index);
  
@@ -37,28 +49,14 @@ index 491cd93a..4e457788 100644
  	g_dnl_clear_detach();
  
  	return ret;
-diff --git a/drivers/usb/gadget/f_dfu.c b/drivers/usb/gadget/f_dfu.c
-index 4bedc7d8..e8153876 100644
 --- a/drivers/usb/gadget/f_dfu.c
 +++ b/drivers/usb/gadget/f_dfu.c
-@@ -173,6 +173,11 @@ static void dnload_request_flush(struct usb_ep *ep, struct usb_request *req)
- 	dfu_set_defer_flush(dfu_get_entity(f_dfu->altsetting));
- }
- 
-+static void dnload_request_detach(struct usb_ep *ep, struct usb_request *req)
-+{
-+	g_dnl_trigger_detach();
-+}
-+
- static inline int dfu_get_manifest_timeout(struct dfu_entity *dfu)
- {
- 	return dfu->poll_timeout ? dfu->poll_timeout(dfu) :
-@@ -490,7 +495,8 @@ static int state_dfu_manifest(struct f_dfu *f_dfu,
+@@ -489,7 +489,7 @@
+ 		f_dfu->dfu_state = DFU_STATE_dfuIDLE;
  		value = handle_getstatus(req);
  		f_dfu->blk_seq_num = 0;
 -		puts("DOWNLOAD ... OK\nCtrl+C to exit ...\n");
-+		puts("DOWNLOAD ... OK\n");
-+		req->complete = dnload_request_detach;
++		puts("DOWNLOAD ... OK\nwaiting for next alt or DFU_DETACH ...\n");
  		break;
  	case USB_REQ_DFU_GETSTATE:
  		value = handle_getstate(req);
