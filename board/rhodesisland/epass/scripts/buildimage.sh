@@ -10,6 +10,14 @@ DTBS_SLOT_SIZE=1048576
 KERNEL_SLOT_SIZE=5242880
 
 cd "${BINARIES_DIR}"
+# 360x640 logo slot fixed to 224KB (gzip padded with zeros) for the on-device logo_changer app
+if [ -f logo-mostima.rgb565.gz ]; then
+    if [ "$(wc -c < logo-mostima.rgb565.gz)" -le 229376 ]; then
+        truncate -s 229376 logo-mostima.rgb565.gz
+        echo "logo slot padded to 229376 bytes"
+    fi
+fi
+
 fakeroot sh -c "rm -r rootfs"
 fakeroot sh -c "rm ubi.img"
 mkdir rootfs
@@ -24,6 +32,14 @@ fakeroot sh -c 'ubinize -o rootfs_ubi.img -m 2048 -p 131072 -O 2048 -s 2048 ubin
 
 echo "building DTBs and kernel FIT images..."
 cd "${BINARIES_DIR}"
+# 360x640 logo slot fixed to 224KB (gzip padded with zeros) for the on-device logo_changer app
+if [ -f logo-mostima.rgb565.gz ]; then
+    if [ "$(wc -c < logo-mostima.rgb565.gz)" -le 229376 ]; then
+        truncate -s 229376 logo-mostima.rgb565.gz
+        echo "logo slot padded to 229376 bytes"
+    fi
+fi
+
 rm -f dtbs.itb kernel.itb boot.itb
 "${MKIMAGE}" -f dtbs.its dtbs.itb || exit 1
 "${MKIMAGE}" -f kernel.its kernel.itb || exit 1
