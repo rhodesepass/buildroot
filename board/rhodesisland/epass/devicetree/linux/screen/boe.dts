@@ -8,7 +8,8 @@
         __overlay__ {
             status = "okay";
             /* pclk_khz hact hfp hslen hbp vact vfp vslen vbp (panel-simple lattland_mostima_mode) */
-            srgn,panel-timing = <24000 360 84 6 78 640 16 4 9>;
+            /* vbp 9->10: 修正 TCON V_BACKPORCH off-by-one 导致的整屏上移 1px */
+            srgn,panel-timing = <24000 360 84 6 78 640 16 4 10>;
             init-sequence = <
                 ST7701INIT_BEGIN_WRITE
 
