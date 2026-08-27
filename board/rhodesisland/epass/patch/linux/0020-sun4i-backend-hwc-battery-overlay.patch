@@ -1,0 +1,395 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] drm/sun4i: DEBE hardware-cursor battery overlay
+
+The suniv DEBE has a hardware cursor (HWC) block that the DRM pipeline
+never programs: it sits at the top of alpha blender0 and is composited
+above every layer.  Since DRM only ever touches the LAY_EN bits of
+MODCTL and never the HWC pattern/palette SRAM, anything we put there
+stays on screen no matter which process owns the DRM master.
+
+Drive it straight from sysfs (mirroring the existing srgn_splash
+handover) to paint a 64x64 1bpp battery icon plus charge percentage in
+the top-right corner.  Controls under /sys/kernel/battery_hwc/:
+
+    enable        0/1   show or hide the overlay
+    percent       0-100 charge level (fill bar + digits)
+    color         ARGB  the single draw colour (palette index 1)
+    show_percent  0/1   draw the numeric percentage
+
+Register layout follows the F1C200s user manual: 64x64 1bpp pattern at
+0x1400 (512 B), ARGB palette at 0x1600.  The percentage is pushed from
+userspace; the driver itself does not read the GPADC.
+
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -897,6 +897,352 @@
+ 	mutex_unlock(&srgn_splash_lock);
+ }
+ 
++/*
++ * DEBE hardware-cursor (HWC) battery overlay.
++ *
++ * The HWC is a separate block in the backend that the DRM pipeline never
++ * touches: it has the highest priority in alpha blender0 and is composited
++ * on top of every layer.  Because DRM only ever pokes the LAY_EN bits of
++ * MODCTL (via regmap_update_bits) and never the HWC pattern/palette SRAM,
++ * whatever we program here survives any atomic commit and stays visible
++ * regardless of who owns the DRM master.  We drive it straight from sysfs,
++ * exactly like the srgn_splash handover above.
++ *
++ * Layout follows the F1C200s user manual (64x64 1bpp cursor):
++ *   pattern memory  0x1400 (5.3.5.55), 512 bytes
++ *   palette table   0x1600 (5.3.5.56), ARGB entries
++ */
++#define BAT_HWC_W		64
++#define BAT_HWC_H		64
++#define BAT_HWC_WORDS		(BAT_HWC_W * BAT_HWC_H / 32)	/* 128 */
++#define BAT_HWC_PAD		8	/* px inset from the top-right corner */
++#define BAT_HWC_PATTERN_OFF	0x1400
++#define BAT_HWC_PALETTE_OFF	0x1600
++#define BAT_HWC_DEFAULT_COLOR	0xffffffffu
++#define BAT_HWC_FALLBACK_W	720	/* used until DISSIZE is programmed */
++
++struct battery_hwc {
++	struct sun4i_backend	*backend;
++	struct kobject		*kobj;
++	bool			enabled;
++	bool			show_percent;
++	u8			percent;	/* 0..100 */
++	u32			color;		/* ARGB, palette index 1 */
++};
++static struct battery_hwc bat_hwc;
++static DEFINE_MUTEX(bat_hwc_lock);
++
++/* font8x8_basic (public domain), LSB = leftmost column; index 10 == '%' */
++#define BAT_HWC_GLYPH_PCT	10
++static const u8 bat_hwc_font[11][8] = {
++	{ 0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00 }, /* 0 */
++	{ 0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00 }, /* 1 */
++	{ 0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00 }, /* 2 */
++	{ 0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00 }, /* 3 */
++	{ 0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00 }, /* 4 */
++	{ 0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00 }, /* 5 */
++	{ 0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00 }, /* 6 */
++	{ 0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00 }, /* 7 */
++	{ 0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00 }, /* 8 */
++	{ 0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00 }, /* 9 */
++	{ 0x63, 0x66, 0x0C, 0x18, 0x30, 0x63, 0x46, 0x00 }, /* % */
++};
++
++static inline void bat_hwc_px(u32 *pat, int x, int y, bool on)
++{
++	if (x < 0 || x >= BAT_HWC_W || y < 0 || y >= BAT_HWC_H)
++		return;
++	if (on)
++		pat[y * 2 + (x >> 5)] |= 1u << (x & 31);
++	else
++		pat[y * 2 + (x >> 5)] &= ~(1u << (x & 31));
++}
++
++static void bat_hwc_hline(u32 *pat, int x0, int x1, int y)
++{
++	for (; x0 <= x1; x0++)
++		bat_hwc_px(pat, x0, y, true);
++}
++
++static void bat_hwc_vline(u32 *pat, int y0, int y1, int x)
++{
++	for (; y0 <= y1; y0++)
++		bat_hwc_px(pat, x, y0, true);
++}
++
++static void bat_hwc_fillrect(u32 *pat, int x0, int y0, int x1, int y1)
++{
++	int y;
++
++	for (y = y0; y <= y1; y++)
++		bat_hwc_hline(pat, x0, x1, y);
++}
++
++/* draw glyph idx at (ox,oy) scaled by s */
++static void bat_hwc_glyph(u32 *pat, int idx, int ox, int oy, int s)
++{
++	const u8 *g = bat_hwc_font[idx];
++	int r, c, i, j;
++
++	for (r = 0; r < 8; r++)
++		for (c = 0; c < 8; c++)
++			if (g[r] & (1u << c))
++				for (j = 0; j < s; j++)
++					for (i = 0; i < s; i++)
++						bat_hwc_px(pat, ox + c * s + i,
++							   oy + r * s + j, true);
++}
++
++static void bat_hwc_render(u32 *pat)
++{
++	const int bx0 = 4, by0 = 4, bx1 = 54, by1 = 30;
++	u8 g[4];
++	int fillw, n = 0, i, nx;
++	u8 p = bat_hwc.percent;
++
++	memset(pat, 0, BAT_HWC_WORDS * sizeof(u32));
++
++	/* battery body outline + positive terminal nub */
++	bat_hwc_hline(pat, bx0, bx1, by0);
++	bat_hwc_hline(pat, bx0, bx1, by1);
++	bat_hwc_vline(pat, by0, by1, bx0);
++	bat_hwc_vline(pat, by0, by1, bx1);
++	bat_hwc_fillrect(pat, bx1 + 1, by0 + 8, bx1 + 4, by1 - 8);
++
++	/* fill bar proportional to charge, inset by 3px */
++	fillw = ((bx1 - bx0 - 5) * p) / 100;
++	if (fillw > 0)
++		bat_hwc_fillrect(pat, bx0 + 3, by0 + 3,
++				 bx0 + 3 + fillw, by1 - 3);
++
++	if (!bat_hwc.show_percent)
++		return;
++
++	/* "NN%" scaled x2, centered under the icon */
++	if (p >= 100) {
++		g[n++] = 1; g[n++] = 0; g[n++] = 0;
++	} else if (p >= 10) {
++		g[n++] = p / 10; g[n++] = p % 10;
++	} else {
++		g[n++] = p % 10;
++	}
++	g[n++] = BAT_HWC_GLYPH_PCT;
++
++	nx = (BAT_HWC_W - n * 16) / 2;
++	if (nx < 0)
++		nx = 0;
++	for (i = 0; i < n; i++)
++		bat_hwc_glyph(pat, g[i], nx + i * 16, 34, 2);
++}
++
++/* program the HWC registers; must be called with bat_hwc_lock held */
++static void bat_hwc_apply(void)
++{
++	static u32 pat[BAT_HWC_WORDS];
++	struct sun4i_backend *backend = bat_hwc.backend;
++	struct regmap *regs;
++	u32 dissize, w;
++	int x, y, i;
++
++	if (!backend)
++		return;
++	regs = backend->engine.regs;
++
++	if (!bat_hwc.enabled) {
++		regmap_update_bits(regs, SUN4I_BACKEND_MODCTL_REG,
++				   SUN4I_BACKEND_MODCTL_HWC_EN, 0);
++		sun4i_backend_commit(&backend->engine);
++		return;
++	}
++
++	/* place at the top-right from the live display size */
++	regmap_read(regs, SUN4I_BACKEND_DISSIZE_REG, &dissize);
++	w = (dissize & 0xffff) + 1;
++	if (w <= BAT_HWC_W)
++		w = BAT_HWC_FALLBACK_W;
++	x = w - BAT_HWC_W - BAT_HWC_PAD;
++	y = BAT_HWC_PAD;
++	if (x < 0)
++		x = 0;
++
++	/* 64x64, 1bpp (HWCFB: Ysize=01<<4, Xsize=01<<2, bpp=00) */
++	regmap_write(regs, SUN4I_BACKEND_HWCFBCTL_REG, (1 << 4) | (1 << 2));
++	regmap_write(regs, SUN4I_BACKEND_HWCCTL_REG,
++		     ((y & 0x7ff) << 16) | (x & 0x7ff));
++
++	/* palette: index 0 transparent, index 1 the requested colour */
++	regmap_write(regs, BAT_HWC_PALETTE_OFF + 0, 0x00000000);
++	regmap_write(regs, BAT_HWC_PALETTE_OFF + 4, bat_hwc.color);
++
++	bat_hwc_render(pat);
++	for (i = 0; i < BAT_HWC_WORDS; i++)
++		regmap_write(regs, BAT_HWC_PATTERN_OFF + i * 4, pat[i]);
++
++	/* enable, touching only the HWC bit so DRM's LAY_EN is preserved */
++	regmap_update_bits(regs, SUN4I_BACKEND_MODCTL_REG,
++			   SUN4I_BACKEND_MODCTL_HWC_EN,
++			   SUN4I_BACKEND_MODCTL_HWC_EN);
++	sun4i_backend_commit(&backend->engine);
++}
++
++static ssize_t bat_hwc_enable_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return scnprintf(buf, PAGE_SIZE, "%d\n", bat_hwc.enabled);
++}
++
++static ssize_t bat_hwc_enable_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int v;
++
++	if (kstrtoint(buf, 0, &v))
++		return -EINVAL;
++	mutex_lock(&bat_hwc_lock);
++	bat_hwc.enabled = !!v;
++	bat_hwc_apply();
++	mutex_unlock(&bat_hwc_lock);
++	return count;
++}
++
++static ssize_t bat_hwc_percent_show(struct kobject *kobj,
++				    struct kobj_attribute *attr, char *buf)
++{
++	return scnprintf(buf, PAGE_SIZE, "%u\n", bat_hwc.percent);
++}
++
++static ssize_t bat_hwc_percent_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int v;
++
++	if (kstrtoint(buf, 0, &v))
++		return -EINVAL;
++	if (v < 0)
++		v = 0;
++	if (v > 100)
++		v = 100;
++	mutex_lock(&bat_hwc_lock);
++	bat_hwc.percent = v;
++	if (bat_hwc.enabled)
++		bat_hwc_apply();
++	mutex_unlock(&bat_hwc_lock);
++	return count;
++}
++
++static ssize_t bat_hwc_color_show(struct kobject *kobj,
++				  struct kobj_attribute *attr, char *buf)
++{
++	return scnprintf(buf, PAGE_SIZE, "0x%08x\n", bat_hwc.color);
++}
++
++static ssize_t bat_hwc_color_store(struct kobject *kobj,
++				   struct kobj_attribute *attr,
++				   const char *buf, size_t count)
++{
++	u32 v;
++
++	if (kstrtou32(buf, 0, &v))
++		return -EINVAL;
++	mutex_lock(&bat_hwc_lock);
++	bat_hwc.color = v;
++	if (bat_hwc.enabled)
++		bat_hwc_apply();
++	mutex_unlock(&bat_hwc_lock);
++	return count;
++}
++
++static ssize_t bat_hwc_show_percent_show(struct kobject *kobj,
++					 struct kobj_attribute *attr, char *buf)
++{
++	return scnprintf(buf, PAGE_SIZE, "%d\n", bat_hwc.show_percent);
++}
++
++static ssize_t bat_hwc_show_percent_store(struct kobject *kobj,
++					  struct kobj_attribute *attr,
++					  const char *buf, size_t count)
++{
++	int v;
++
++	if (kstrtoint(buf, 0, &v))
++		return -EINVAL;
++	mutex_lock(&bat_hwc_lock);
++	bat_hwc.show_percent = !!v;
++	if (bat_hwc.enabled)
++		bat_hwc_apply();
++	mutex_unlock(&bat_hwc_lock);
++	return count;
++}
++
++static struct kobj_attribute bat_hwc_enable_attr =
++	__ATTR(enable, 0644, bat_hwc_enable_show, bat_hwc_enable_store);
++static struct kobj_attribute bat_hwc_percent_attr =
++	__ATTR(percent, 0644, bat_hwc_percent_show, bat_hwc_percent_store);
++static struct kobj_attribute bat_hwc_color_attr =
++	__ATTR(color, 0644, bat_hwc_color_show, bat_hwc_color_store);
++static struct kobj_attribute bat_hwc_show_percent_attr =
++	__ATTR(show_percent, 0644, bat_hwc_show_percent_show,
++	       bat_hwc_show_percent_store);
++
++static struct attribute *bat_hwc_attrs[] = {
++	&bat_hwc_enable_attr.attr,
++	&bat_hwc_percent_attr.attr,
++	&bat_hwc_color_attr.attr,
++	&bat_hwc_show_percent_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group bat_hwc_group = {
++	.attrs = bat_hwc_attrs,
++};
++
++static void battery_hwc_init(struct device *dev, struct sun4i_backend *backend)
++{
++	int ret;
++
++	mutex_lock(&bat_hwc_lock);
++	if (bat_hwc.backend) {		/* only the first backend owns it */
++		mutex_unlock(&bat_hwc_lock);
++		return;
++	}
++	bat_hwc.backend = backend;
++	bat_hwc.enabled = false;
++	bat_hwc.show_percent = true;
++	bat_hwc.percent = 100;
++	bat_hwc.color = BAT_HWC_DEFAULT_COLOR;
++	mutex_unlock(&bat_hwc_lock);
++
++	bat_hwc.kobj = kobject_create_and_add("battery_hwc", kernel_kobj);
++	if (!bat_hwc.kobj) {
++		dev_warn(dev, "battery_hwc: could not create sysfs dir\n");
++		return;
++	}
++	ret = sysfs_create_group(bat_hwc.kobj, &bat_hwc_group);
++	if (ret) {
++		dev_warn(dev, "battery_hwc: could not create sysfs group\n");
++		kobject_put(bat_hwc.kobj);
++		bat_hwc.kobj = NULL;
++	}
++}
++
++static void battery_hwc_fini(struct sun4i_backend *backend)
++{
++	mutex_lock(&bat_hwc_lock);
++	if (bat_hwc.backend != backend) {
++		mutex_unlock(&bat_hwc_lock);
++		return;
++	}
++	if (bat_hwc.kobj) {
++		sysfs_remove_group(bat_hwc.kobj, &bat_hwc_group);
++		kobject_put(bat_hwc.kobj);
++		bat_hwc.kobj = NULL;
++	}
++	bat_hwc.backend = NULL;
++	mutex_unlock(&bat_hwc_lock);
++}
++
+ static int sun4i_backend_bind(struct device *dev, struct device *master,
+ 			      void *data)
+ {
+@@ -1058,6 +1404,8 @@
+ 		srgn_splash_handover_init(dev, backend);
+ 	}
+ 
++	battery_hwc_init(dev, backend);
++
+ 	backend->quirks = quirks;
+ 
+ 	return 0;
+@@ -1078,6 +1426,8 @@
+ {
+ 	struct sun4i_backend *backend = dev_get_drvdata(dev);
+ 
++	battery_hwc_fini(backend);
++
+ 	list_del(&backend->engine.list);
+ 
+ 	if (of_device_is_compatible(dev->of_node,
